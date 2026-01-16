@@ -146,4 +146,91 @@ async def spontaneous_loop(bot: Bot):
             )
             rows = (await session.execute(q)).scalars().all()
 
-        seed = "\n".join([f"{r.username or]()
+        seed = "\n".join([f"{r.username or r.user_id}: {r.text}" for r in reversed(rows)])
+        prompt = (
+            "Ты сейчас сам решил написать в чат друзей.\n"
+            "Скажи что-то уместное по последним сообщениям.\n"
+            "Если нечего сказать — можешь вообще не писать.\n\n"
+            f"Последнее:\n{seed}"
+        )
+
+        ctx = await build_context(seed[-500:] if seed else "чат")
+        raw = generate_reply(user_text=prompt, context_snippets=ctx).get("_raw", "")
+        action = _parse_action(raw)
+
+        # если модель “решила молчать” — пусть вернёт пустой text
+        if (action.get("type") == "text") and not (action.get("text") or "").strip():
+            continue
+
+        await act(bot, settings.TARGET_GROUP_ID, action)
+
+
+async def main():
+    if not settings.BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN пустой")
+    if not settings.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY пустой")
+
+    await init_db()
+
+    bot = Bot(settings.BOT_TOKEN)
+    dp = Dispatcher()
+
+    me = await bot.get_me()
+    bot_username = me.username
+
+    # фоновая автономия
+    asyncio.create_task(spontaneous_loop(bot))
+
+    @dp.message(F.text)
+    async def on_text(message: Message):
+        if not _is_target_group(message):
+            return
+
+        # всегда сохраняем/индексируем всех (память чата)
+        try:
+            await save_and_index(message)
+        except Exception as e:
+            logging.error(f"save/index error: {e}")
+
+        if not settings.AUTONOMY_ENABLED:
+            return
+
+        # owner-only: бот “видит” всех, но отвечает только owner
+        if settings.OWNER_ONLY_MODE and not _is_owner(message):
+            # но упоминания всё равно могут “разбудить” решалку — без ответа
+            return
+
+        text = (message.text or "").strip()
+        is_mention = _mentioned(bot_username, text)
+
+        base_prob = settings.MENTION_REPLY_PROB if is_mention else settings.REPLY_PROB
+        if random.random() > base_prob:
+            return
+
+        ctx = await build_context(text)
+
+        try:
+            ok = decide_reply(last_text=text, is_mention=is_mention, context_snippets=ctx)
+        except Exception as e:
+            logging.error(f"decide_reply error: {e}")
+            return
+        if not ok:
+            return
+
+        raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
+        action = _parse_action(raw)
+
+        try:
+            await act(bot, message.chat.id, action)
+        except Exception as e:
+            logging.error(f"act error: {e}")
+            # fallback text
+            await message.reply("У меня чё-то с мультимедиа залипло. Ща оклемаюсь.")
+
+    logging.info("Balbes автономный стартанул")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
