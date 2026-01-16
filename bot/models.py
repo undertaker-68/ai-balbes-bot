@@ -6,7 +6,6 @@ class Base(DeclarativeBase):
 
 class MessageRow(Base):
     __tablename__ = "messages"
-
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
