@@ -251,16 +251,6 @@ async def main():
         if should_react_alongside_text(is_mention):
             await react(bot, message, emoji)
 
-        raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
-        action = _parse_action(raw)
-
-        try:
-            await act(bot, message.chat.id, action)
-        except Exception as e:
-            logging.error(f"act error: {e}")
-            # fallback text
-            await message.reply("У меня чё-то с мультимедиа залипло. Ща оклемаюсь.")
-
     logging.info("Balbes автономный стартанул")
     await dp.start_polling(bot)
 
