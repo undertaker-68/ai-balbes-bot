@@ -44,6 +44,16 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+async def react(bot: Bot, message: Message, emoji: str) -> None:
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+    except Exception as e:
+        # Реакции могут быть запрещены в группе или не поддержаны
+        logging.error(f"reaction error: {e}")
 
 async def save_and_index(message: Message):
     text = (message.text or "").strip()
@@ -219,6 +229,17 @@ async def main():
             logging.error(f"decide_reply error: {e}")
             return
         if not ok:
+            return
+
+        # 1) Иногда вместо ответа — просто реакция (очень по-человечески)
+        emoji = pick_reaction(text)
+
+        if should_react_only(is_mention):
+            await react(bot, message, emoji)
+
+        # 2) Иногда реакция вместе с ответом (как “человек поставил смайл”)
+        if should_react_alongside_text(is_mention):
+            await react(bot, message, emoji)
             return
 
         raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
