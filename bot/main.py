@@ -1,4 +1,4 @@
-from __future__ import annotations
+    from __future__ import annotations
 
 import asyncio
 import json
@@ -236,11 +236,20 @@ async def main():
 
         if should_react_only(is_mention):
             await react(bot, message, emoji)
+            return
+
+        raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
+        action = _parse_action(raw)
+
+        try:
+            await act(bot, message.chat.id, action)
+        except Exception as e:
+            logging.error(f"act error: {e}")
+            await message.reply("У меня чё-то с мультимедиа залипло. Ща оклемаюсь.")
 
         # 2) Иногда реакция вместе с ответом (как “человек поставил смайл”)
         if should_react_alongside_text(is_mention):
             await react(bot, message, emoji)
-            return
 
         raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
         action = _parse_action(raw)
