@@ -1,0 +1,14 @@
+aiogram==3.24.0
+python-dotenv==1.0.1
+pydantic==2.7.4
+pydantic-settings==2.3.4
+
+openai==1.40.8
+
+SQLAlchemy==2.0.32
+asyncpg==0.29.0
+
+qdrant-client==1.9.2
+
+orjson==3.10.7
+tenacity==8.5.0
