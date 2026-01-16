@@ -60,6 +60,10 @@ async def save_and_index(message: Message):
     if not text:
         return
 
+    # Если Qdrant выключен — не считаем эмбеддинги и не индексируем
+    if not settings.QDRANT_URL:
+        return
+
     user_id = message.from_user.id if message.from_user else 0
     username = message.from_user.username if message.from_user else None
 
