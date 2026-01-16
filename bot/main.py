@@ -70,12 +70,18 @@ async def save_and_index(message: Message):
         row_id = row.id
         await session.commit()
 
+    if not settings.QDRANT_URL:
+    return
+
     vec = embed(text)
     ensure_collection(vector_size=len(vec))
     upsert(point_id=row_id, vector=vec, payload={"text": text, "user_id": user_id, "username": username})
 
 
 async def build_context(user_text: str) -> str:
+    if not settings.QDRANT_URL:
+    return ""
+
     vec = embed(user_text)
     hits = rag_search(vec, limit=8)
     lines = []
