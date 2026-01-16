@@ -25,6 +25,8 @@ services:
       - postgres
       - qdrant
     restart: unless-stopped
+    volumes:
+      - ./assets:/app/assets
 
 volumes:
   pgdata:
