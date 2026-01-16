@@ -2,23 +2,28 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 from .settings import settings
 
-def qdrant_client() -> QdrantClient:
+def qc() -> QdrantClient:
     return QdrantClient(url=settings.QDRANT_URL)
 
-async def ensure_collection(client: QdrantClient, vector_size: int) -> None:
-    collections = client.get_collections().collections
-    exists = any(c.name == settings.QDRANT_COLLECTION for c in collections)
-    if exists:
+def ensure_collection(vector_size: int) -> None:
+    client = qc()
+    names = [c.name for c in client.get_collections().collections]
+    if settings.QDRANT_COLLECTION in names:
         return
     client.create_collection(
         collection_name=settings.QDRANT_COLLECTION,
         vectors_config=qm.VectorParams(size=vector_size, distance=qm.Distance.COSINE),
     )
 
-def upsert_points(client: QdrantClient, points: list[qm.PointStruct]) -> None:
-    client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points)
+def upsert(point_id: int, vector: list[float], payload: dict) -> None:
+    client = qc()
+    client.upsert(
+        collection_name=settings.QDRANT_COLLECTION,
+        points=[qm.PointStruct(id=point_id, vector=vector, payload=payload)],
+    )
 
-def search(client: QdrantClient, query_vector: list[float], limit: int) -> list[dict]:
+def search(query_vector: list[float], limit: int) -> list[dict]:
+    client = qc()
     res = client.search(
         collection_name=settings.QDRANT_COLLECTION,
         query_vector=query_vector,
@@ -27,12 +32,6 @@ def search(client: QdrantClient, query_vector: list[float], limit: int) -> list[
     )
     out = []
     for r in res:
-        payload = r.payload or {}
-        out.append({
-            "score": r.score,
-            "text": payload.get("text", ""),
-            "user_id": payload.get("user_id"),
-            "username": payload.get("username"),
-            "created_at": payload.get("created_at"),
-        })
+        p = r.payload or {}
+        out.append({"score": r.score, "text": p.get("text",""), "username": p.get("username"), "user_id": p.get("user_id")})
     return out
