@@ -71,11 +71,14 @@ async def on_text(message: Message, bot: Bot) -> None:
         and f"@{message.from_user.username}" in text
     )
 
-    # решаем: отвечать или нет
+    ctx = await build_context(text)
+
     ok = decide_reply(
-        text=text,
+        last_text=text,
         is_mention=is_mention,
+        context_snippets=ctx,
     )
+
     if not ok:
         return
 
