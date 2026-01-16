@@ -9,6 +9,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from sqlalchemy import select
 
+from aiogram.types import ReactionTypeEmoji
+from .reactions import pick_reaction, should_react_only, should_react_alongside_text
+
 from .settings import settings
 from .db import engine, SessionLocal
 from .models import Base, MessageRow
