@@ -5,7 +5,6 @@ import asyncpg
 import re
 import logging
 import random
-from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
@@ -36,7 +35,6 @@ async def save_and_index(message: Message) -> None:
 
 
 def _keywords(s: str) -> str:
-    # берём слова длиннее 2 символов, ограничим 8
     ws = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", s.lower())
     ws = ws[:8]
     return " ".join(ws)
@@ -50,7 +48,6 @@ async def build_context(user_text: str) -> str:
     if not q:
         return ""
 
-    # FTS: ищем топ релевантных
     rows = await _pg_pool.fetch(
         """
         SELECT dt, from_name, text
@@ -65,7 +62,6 @@ async def build_context(user_text: str) -> str:
     )
 
     if not rows:
-        # запасной вариант: ILIKE по фразе (если FTS ничего не нашёл)
         rows = await _pg_pool.fetch(
             """
             SELECT dt, from_name, text
@@ -79,7 +75,6 @@ async def build_context(user_text: str) -> str:
             user_text[:64],
         )
 
-    # форматируем “воспоминания”
     parts = []
     for r in rows:
         dt = r["dt"].isoformat() if r["dt"] else ""
@@ -113,26 +108,29 @@ async def on_text(message: Message, bot: Bot) -> None:
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
-    text_l = (text or "").lower()
+    text_l = text.lower()
 
-    owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
+    owner_mentioned = False
+    if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_MENTION:
+        owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
 
     reply_to_owner = False
-    if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None):
-        reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
+    if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_REPLY_TO_OWNER:
+        if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None):
+            reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
 
     target_owner = owner_mentioned or reply_to_owner
 
-    # режим для генератора
     mode = "normal"
     if is_owner:
         mode = "owner"
     elif target_owner:
         mode = "defend_owner"
 
-    # сохраняем сообщение (пока пустышка)
     await save_and_index(message)
 
+    # Внимание: этот is_mention у тебя был странный (проверял username автора сообщения).
+    # Оставляю как есть, чтобы не ломать логику реакций.
     is_mention = (
         message.from_user
         and message.from_user.username
@@ -140,16 +138,11 @@ async def on_text(message: Message, bot: Bot) -> None:
     )
 
     ctx = await build_context(text)
-    
-    ok = True
-    #ok = decide_reply(
-    #    last_text=text,
-    #    is_mention=is_mention,
-    #    context_snippets=ctx,
-   # )
 
-  #  if not ok:
-   #     return
+    ok = True
+    # ok = decide_reply(last_text=text, is_mention=is_mention, context_snippets=ctx)
+    # if not ok:
+    #     return
 
     emoji = pick_reaction(text)
 
@@ -158,22 +151,20 @@ async def on_text(message: Message, bot: Bot) -> None:
         await react(bot, message, emoji)
         return
 
-   # 2) генерим ответ
-    ctx = await build_context(text)
-    raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
+    # 2) генерим ответ
+    raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "")
 
     # ✅ нормализуем: если пришёл JSON-блок — достаём content
     out_text = raw
     try:
-        import json, re
-        m = re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=re.S)
+        import json as _json, re as _re
+        m = _re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=_re.S)
         if m:
-            obj = json.loads(m.group(1))
+            obj = _json.loads(m.group(1))
             out_text = obj.get("content") or obj.get("text") or raw
     except Exception:
         pass
 
-    # отправка
     try:
         await message.reply(out_text)
     except Exception as e:
@@ -200,6 +191,7 @@ async def spontaneous_loop(bot: Bot) -> None:
             text = generate_reply(
                 user_text="",
                 context_snippets="",
+                mode="normal",
             ).get("_raw", "")
 
             if text:
@@ -214,6 +206,7 @@ async def spontaneous_loop(bot: Bot) -> None:
 
 async def main() -> None:
     bot = Bot(token=settings.BOT_TOKEN)
+
     global _pg_pool
     _pg_pool = await asyncpg.create_pool(
         host=settings.DB_HOST,
@@ -226,7 +219,6 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
-
     dp.message.register(on_text, F.text)
 
     logging.info("Balbes автономный стартанул")
