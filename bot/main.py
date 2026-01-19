@@ -236,7 +236,7 @@ async def on_text(message: Message, bot: Bot) -> None:
 
 
 async def on_photo(message: Message, bot: Bot) -> None:
-    # вариант A: если есть подпись — анализируем всегда; если нет — иногда
+    # Всегда анализируем фото и отвечаем (без команд)
     if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
         return
     if not message.photo:
@@ -244,33 +244,22 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
     await save_and_index(message)
 
+    # владельцу не отвечаем
+    uid = message.from_user.id if message.from_user else None
+    if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+        return
+
     caption = (message.caption or "").strip()
     mode = _owner_defense_mode_for_text(caption, message) if caption else "normal"
     emoji = pick_reaction(caption or "photo")
     is_mention = await _compute_is_mention(bot, message, caption or "")
 
-    # владелец прислал фото — молчим (но в память записали)
-    uid = message.from_user.id if message.from_user else None
-    if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
-        return
-
-    should = await _gate_reply(bot, message, mode, is_mention, emoji)
-    if not should:
-        return
-
-    # Если подписи нет — комментим только иногда (чтобы не быть навязчивым)
-    if not caption:
-        if random.random() > 0.35:
-            # иногда просто реакция
-            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
-                await react(bot, message, emoji)
-            return
-
+    # фото = всегда отвечаем (антиспам можно оставить только на текст)
     _last_reply_ts[int(message.chat.id)] = time.time()
 
     ctx = await build_context_24h(int(message.chat.id))
 
-    # скачиваем картинку
+    # скачиваем фото
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
@@ -278,16 +267,16 @@ async def on_photo(message: Message, bot: Bot) -> None:
         image_bytes = buf.read()
     except Exception as e:
         logging.debug(f"download photo error: {e}")
-        # fallback: хотя бы текстом
+        # fallback: хотя бы коротко текстом
         raw = generate_reply(
-            user_text=(caption or "на фотке что-то, но я не смог скачать"),
+            user_text=(caption or "чё там на фотке? у меня не скачалось"),
             context_snippets=ctx,
             mode=mode,
         ).get("_raw", "")
         await message.reply(raw)
         return
 
-    # анализ vision
+    # анализ vision (всегда)
     try:
         raw = analyze_image(
             image_bytes=image_bytes,
@@ -298,10 +287,14 @@ async def on_photo(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.debug(f"vision error: {e}")
         raw = generate_reply(
-            user_text=(caption or "чё за картинка вообще"),
+            user_text=(caption or "ну, картинка какая-то…"),
             context_snippets=ctx,
             mode=mode,
         ).get("_raw", "")
+
+    # иногда добавим реакцию, но ответ всё равно будет
+    if random.random() < 0.25:
+        await react(bot, message, emoji)
 
     try:
         await message.reply(raw)
