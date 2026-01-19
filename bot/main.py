@@ -17,9 +17,8 @@ from .reactions import (
     should_react_alongside_text,
 )
 
-import random
-from bot.services.giphy import search_gif
-from bot.settings import settings
+# GIPHY (используем относительный импорт внутри пакета bot)
+from .services.giphy import search_gif
 
 _pg_pool: asyncpg.Pool | None = None
 
@@ -42,6 +41,7 @@ def _keywords(s: str) -> str:
     ws = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", s.lower())
     ws = ws[:8]
     return " ".join(ws)
+
 
 async def build_context(user_text: str) -> str:
     global _pg_pool
@@ -89,6 +89,7 @@ async def build_context(user_text: str) -> str:
 
     return "\n".join(parts)
 
+
 async def react(bot: Bot, message: Message, emoji: str) -> None:
     try:
         await bot.set_message_reaction(
@@ -108,7 +109,7 @@ async def on_text(message: Message, bot: Bot) -> None:
     text = (message.text or "").strip()
     if not text:
         return
-    
+
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
@@ -151,24 +152,23 @@ async def on_text(message: Message, bot: Bot) -> None:
     emoji = pick_reaction(text)
 
     # --- GIF mode via GIPHY ---
-if settings.GIPHY_API_KEY:
-    p = float(getattr(settings, "GIPHY_PROB", 0.18))
+    if getattr(settings, "GIPHY_API_KEY", ""):
+        p = float(getattr(settings, "GIPHY_PROB", 0.18))
 
-    # чаще кидаем гифку, когда защищаем владельца
-    if mode == "defend_owner":
-        p = min(0.45, p * 2.0)
+        # чаще кидаем гифку, когда защищаем владельца
+        if mode == "defend_owner":
+            p = min(0.45, p * 2.0)
 
-    if random.random() < p:
-        # короткий запрос — 2-5 слов
-        q = " ".join(text.split()[:5])
-        gif_url = await search_gif(q)
-        if gif_url:
-            await bot.send_animation(
-                chat_id=message.chat.id,
-                animation=gif_url,
-                reply_to_message_id=message.message_id,
-            )
-            return
+        if random.random() < p:
+            q = " ".join(text.split()[:5]) or "reaction"
+            gif_url = await search_gif(q)
+            if gif_url:
+                await bot.send_animation(
+                    chat_id=message.chat.id,
+                    animation=gif_url,
+                    reply_to_message_id=message.message_id,
+                )
+                return
 
     # 1) иногда ТОЛЬКО реакция
     if should_react_only(is_mention):
