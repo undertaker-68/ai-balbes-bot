@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import asyncpg
-import re
 import logging
 import random
 import time
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
@@ -13,7 +13,6 @@ from aiogram.types import Message, ReactionTypeEmoji
 from .settings import settings
 from .ai import generate_reply
 from .reactions import pick_reaction, should_react_only
-
 from .services.giphy import search_gif
 
 _pg_pool: asyncpg.Pool | None = None
@@ -23,56 +22,85 @@ logging.basicConfig(level=logging.INFO)
 
 
 async def save_and_index(message: Message) -> None:
-    return
+    """Пишем входящее сообщение в tg_history (как в твоём импортере)."""
+    global _pg_pool
+    if _pg_pool is None:
+        return
+
+    try:
+        chat_id = int(message.chat.id)
+        msg_id = int(message.message_id)
+
+        # aiogram Message.date обычно datetime с tz, но на всякий:
+        dt = message.date
+        if isinstance(dt, datetime) and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        from_name = None
+        from_id = None
+        if message.from_user:
+            from_id = str(message.from_user.id)
+            from_name = (message.from_user.full_name or message.from_user.username or "").strip() or None
+
+        text = (message.text or "").strip()
+        if not text:
+            return
+
+        await _pg_pool.execute(
+            """
+            INSERT INTO tg_history (chat_id, msg_id, dt, from_name, from_id, text)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (chat_id, msg_id) DO NOTHING
+            """,
+            chat_id, msg_id, dt, from_name, from_id, text
+        )
+    except Exception as e:
+        logging.debug(f"save_and_index error: {e}")
 
 
-def _keywords(s: str) -> str:
-    ws = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", s.lower())
-    return " ".join(ws[:8])
-
-
-async def build_context(user_text: str) -> str:
+async def build_context_24h(chat_id: int) -> str:
+    """Память: последние сообщения за 24 часа, обрезанные по длине."""
     global _pg_pool
     if _pg_pool is None:
         return ""
 
-    q = _keywords(user_text)
-    if not q:
-        return ""
-
-    rows = await _pg_pool.fetch(
-        """
-        SELECT dt, from_name, text
-        FROM tg_history
-        WHERE chat_id = $1
-          AND to_tsvector('russian', coalesce(text,'')) @@ plainto_tsquery('russian', $2)
-        ORDER BY dt DESC
-        LIMIT 20
-        """,
-        settings.TARGET_GROUP_ID,
-        q,
-    )
-
-    if not rows:
+    try:
         rows = await _pg_pool.fetch(
             """
             SELECT dt, from_name, text
             FROM tg_history
             WHERE chat_id = $1
-              AND text ILIKE '%' || $2 || '%'
+              AND dt >= (NOW() - INTERVAL '24 hours')
             ORDER BY dt DESC
-            LIMIT 10
+            LIMIT $2
             """,
-            settings.TARGET_GROUP_ID,
-            user_text[:64],
+            int(chat_id),
+            int(getattr(settings, "MEMORY_24H_LIMIT", 70)),
         )
+    except Exception as e:
+        logging.debug(f"build_context_24h db error: {e}")
+        return ""
 
-    parts = []
+    if not rows:
+        return ""
+
+    # хотим хронологию: старое -> новое
+    rows = list(reversed(rows))
+
+    max_chars = int(getattr(settings, "MEMORY_24H_MAX_CHARS", 6500))
+    parts: list[str] = []
+    cur = 0
+
     for r in rows:
-        dt = r["dt"].isoformat() if r["dt"] else ""
-        frm = r["from_name"] or "кто-то"
-        txt = (r["text"] or "").strip()[:300]
-        parts.append(f"{dt} — {frm}: {txt}")
+        frm = (r["from_name"] or "кто-то").strip()
+        txt = (r["text"] or "").strip().replace("\n", " ")
+        if not txt:
+            continue
+        line = f"{frm}: {txt}"
+        if cur + len(line) + 1 > max_chars:
+            break
+        parts.append(line)
+        cur += len(line) + 1
 
     return "\n".join(parts)
 
@@ -89,6 +117,10 @@ async def react(bot: Bot, message: Message, emoji: str) -> None:
 
 
 async def on_text(message: Message, bot: Bot) -> None:
+    # работаем только в целевой группе
+    if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
+        return
+
     text = (message.text or "").strip()
     if not text:
         return
@@ -96,8 +128,16 @@ async def on_text(message: Message, bot: Bot) -> None:
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
+    # сохраняем ВСЁ в память
+    await save_and_index(message)
+
+    # владелец пишет — бот молчит (по твоему требованию)
+    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+        return
+
     text_l = text.lower()
 
+    # режим защиты владельца
     owner_mentioned = False
     if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_MENTION:
         owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
@@ -107,75 +147,55 @@ async def on_text(message: Message, bot: Bot) -> None:
         if message.reply_to_message and message.reply_to_message.from_user:
             reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
 
-    target_owner = owner_mentioned or reply_to_owner
+    mode = "defend_owner" if (owner_mentioned or reply_to_owner) else "normal"
 
-    mode = "normal"
-    if is_owner:
-        mode = "owner"
-    elif target_owner:
-        mode = "defend_owner"
-
-    await save_and_index(message)
-
-    # ---- proper "mention": mention bot OR reply-to-bot ----
+    # упоминание бота / reply-to-bot => отвечаем всегда
     me = await bot.get_me()
     bot_username = (me.username or "").lower()
     bot_id = me.id
 
     mention_bot = bool(bot_username) and (f"@{bot_username}" in text_l)
-
-    reply_to_bot = False
-    if message.reply_to_message and message.reply_to_message.from_user:
-        reply_to_bot = (message.reply_to_message.from_user.id == bot_id)
-
+    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_id)
     is_mention = mention_bot or reply_to_bot
 
-    # ---- gate: bot chooses when to reply ----
-    must_reply = False
-    if is_mention:
-        must_reply = True
-    if mode == "owner" and settings.ALWAYS_REPLY_OWNER:
-        must_reply = True
-    if mode == "defend_owner" and settings.ALWAYS_REPLY_DEFEND_OWNER:
-        must_reply = True
-
+    # антиспам + вероятность (но почти всегда)
     now = time.time()
-    chat_id = message.chat.id
+    chat_id = int(message.chat.id)
     emoji = pick_reaction(text)
+
+    must_reply = is_mention or (mode == "defend_owner")
 
     if not must_reply:
         last = _last_reply_ts.get(chat_id, 0.0)
-        # cooldown gate
-        if now - last < float(settings.REPLY_COOLDOWN_SEC):
-            if random.random() < float(settings.REACT_PROB_WHEN_SILENT):
+        if now - last < float(getattr(settings, "REPLY_COOLDOWN_SEC", 8)):
+            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
                 await react(bot, message, emoji)
             return
 
-        # probability gate
-        if random.random() > float(settings.REPLY_PROB_NORMAL):
-            if random.random() < float(settings.REACT_PROB_WHEN_SILENT):
+        if random.random() > float(getattr(settings, "REPLY_PROB_NORMAL", 0.92)):
+            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
                 await react(bot, message, emoji)
             return
 
-    # мы решили отвечать
     _last_reply_ts[chat_id] = now
 
-    ctx = await build_context(text)
+    # память за 24 часа
+    ctx = await build_context_24h(chat_id)
 
-    # ---- optional: sometimes react-only when directly pinged ----
+    # иногда только реакция (как человек), особенно если тегнули бота
     if should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         return
 
-    # ---- try send GIF (never crash update) ----
+    # иногда гифка
     if getattr(settings, "GIPHY_API_KEY", ""):
-        p = float(getattr(settings, "GIPHY_PROB", 0.18))
+        p = float(getattr(settings, "GIPHY_PROB", 0.22))
         if mode == "defend_owner":
-            p = min(0.45, p * 2.0)
+            p = min(0.55, p * 1.8)
 
         if random.random() < p:
             q = " ".join(text.split()[:5]) or "reaction"
-            gif_url = await search_gif(q)  # inside giphy.py errors become None
+            gif_url = await search_gif(q)  # у тебя giphy.py уже “не падает”
             if gif_url:
                 try:
                     await bot.send_animation(
@@ -187,19 +207,9 @@ async def on_text(message: Message, bot: Bot) -> None:
                 except Exception as e:
                     logging.debug(f"send_animation error: {e}")
 
-    # ---- text reply ----
+    # текстовый ответ
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "")
     out_text = raw
-
-    # if model returns ```json {...}``` extract
-    try:
-        import json as _json, re as _re
-        m = _re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=_re.S)
-        if m:
-            obj = _json.loads(m.group(1))
-            out_text = obj.get("content") or obj.get("text") or raw
-    except Exception:
-        pass
 
     try:
         await message.reply(out_text)
@@ -208,21 +218,22 @@ async def on_text(message: Message, bot: Bot) -> None:
 
 
 async def spontaneous_loop(bot: Bot) -> None:
+    """Иногда сам начинает разговор (в пределах заданной вероятности)."""
     while True:
         await asyncio.sleep(
             random.randint(
-                settings.SPONTANEOUS_MIN_SEC,
-                settings.SPONTANEOUS_MAX_SEC,
+                int(getattr(settings, "SPONTANEOUS_MIN_SEC", 180)),
+                int(getattr(settings, "SPONTANEOUS_MAX_SEC", 540)),
             )
         )
 
-        if random.random() > settings.SPONTANEOUS_PROB:
+        if random.random() > float(getattr(settings, "SPONTANEOUS_PROB", 0.12)):
             continue
 
         try:
-            text = generate_reply(user_text="", context_snippets="", mode="normal").get("_raw", "")
+            text = generate_reply(user_text="", context_snippets=await build_context_24h(int(settings.TARGET_GROUP_ID)), mode="normal").get("_raw", "")
             if text:
-                await bot.send_message(settings.TARGET_GROUP_ID, text)
+                await bot.send_message(int(settings.TARGET_GROUP_ID), text)
         except Exception as e:
             logging.debug(f"spontaneous error: {e}")
 
