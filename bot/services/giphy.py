@@ -4,16 +4,21 @@ from bot.settings import settings
 
 BASE = "https://api.giphy.com/v1/gifs"
 
+
 async def _get_json(url: str, params: dict) -> dict:
-    timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.get(url, params=params) as r:
-            if r.status != 200:
-                return {}
-            return await r.json()
+    timeout = aiohttp.ClientTimeout(total=4)  # короче, чтобы не стопорить апдейты
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params=params) as r:
+                if r.status != 200:
+                    return {}
+                return await r.json()
+    except Exception:
+        # Важно: никаких исключений наружу — иначе aiogram "роняет" update
+        return {}
+
 
 def _pick_best_url(gif_obj: dict) -> Optional[str]:
-    # Лучше брать mp4 — Telegram обычно стабильнее показывает
     images = (gif_obj or {}).get("images") or {}
     for path in [
         ("original_mp4", "mp4"),
@@ -27,16 +32,16 @@ def _pick_best_url(gif_obj: dict) -> Optional[str]:
             return u
     return None
 
+
 async def get_gif_by_id(gif_id: str) -> Optional[str]:
-    # GIPHY get GIF by id: /v1/gifs/{gif_id} :contentReference[oaicite:1]{index=1}
     url = f"{BASE}/{gif_id}"
     params = {"api_key": settings.GIPHY_API_KEY}
     data = await _get_json(url, params)
     gif_obj = (data or {}).get("data")
     return _pick_best_url(gif_obj)
 
+
 async def search_gif(query: str, limit: int = 8) -> Optional[str]:
-    # Search endpoint: /v1/gifs/search :contentReference[oaicite:2]{index=2}
     url = f"{BASE}/search"
     params = {
         "api_key": settings.GIPHY_API_KEY,
