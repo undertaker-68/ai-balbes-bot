@@ -1,0 +1,13 @@
+
+# secrets
+.env
+
+# python junk
+__pycache__/
+*.pyc
+
+# venv
+venv/
+
+# artifacts (choose one: ignore all OR track only selected files)
+artifacts/
