@@ -5,42 +5,33 @@ import asyncpg
 import re
 import logging
 import random
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
 
 from .settings import settings
-from .ai import decide_reply, generate_reply
-from .reactions import (
-    pick_reaction,
-    should_react_only,
-    should_react_alongside_text,
-)
+from .ai import generate_reply
+from .reactions import pick_reaction, should_react_only
 
-# GIPHY (используем относительный импорт внутри пакета bot)
 from .services.giphy import search_gif
 
 _pg_pool: asyncpg.Pool | None = None
+_last_reply_ts: dict[int, float] = {}
+
+# кеш инфы о боте (username/id), чтобы не дергать get_me на каждое сообщение
+_bot_cached = {"id": None, "username": None}
 
 logging.basicConfig(level=logging.INFO)
 
 
-# =========================
-# DB / MEMORY (ВРЕМЕННО ВЫКЛЮЧЕНО)
-# =========================
-
 async def save_and_index(message: Message) -> None:
-    """
-    Временно отключено.
-    Оставлено для совместимости архитектуры.
-    """
     return
 
 
 def _keywords(s: str) -> str:
     ws = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", s.lower())
-    ws = ws[:8]
-    return " ".join(ws)
+    return " ".join(ws[:8])
 
 
 async def build_context(user_text: str) -> str:
@@ -83,8 +74,7 @@ async def build_context(user_text: str) -> str:
     for r in rows:
         dt = r["dt"].isoformat() if r["dt"] else ""
         frm = r["from_name"] or "кто-то"
-        txt = (r["text"] or "").strip()
-        txt = txt[:300]
+        txt = (r["text"] or "").strip()[:300]
         parts.append(f"{dt} — {frm}: {txt}")
 
     return "\n".join(parts)
@@ -101,9 +91,15 @@ async def react(bot: Bot, message: Message, emoji: str) -> None:
         logging.debug(f"reaction error: {e}")
 
 
-# =========================
-# MESSAGE HANDLER
-# =========================
+async def _get_bot_identity(bot: Bot) -> tuple[int, str]:
+    if _bot_cached["id"] and _bot_cached["username"] is not None:
+        return _bot_cached["id"], _bot_cached["username"]
+
+    me = await bot.get_me()
+    _bot_cached["id"] = me.id
+    _bot_cached["username"] = (me.username or "").lower()
+    return _bot_cached["id"], _bot_cached["username"]
+
 
 async def on_text(message: Message, bot: Bot) -> None:
     text = (message.text or "").strip()
@@ -115,13 +111,14 @@ async def on_text(message: Message, bot: Bot) -> None:
 
     text_l = text.lower()
 
+    # owner mention/reply detect
     owner_mentioned = False
     if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_MENTION:
         owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
 
     reply_to_owner = False
     if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_REPLY_TO_OWNER:
-        if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None):
+        if message.reply_to_message and message.reply_to_message.from_user:
             reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
 
     target_owner = owner_mentioned or reply_to_owner
@@ -134,122 +131,40 @@ async def on_text(message: Message, bot: Bot) -> None:
 
     await save_and_index(message)
 
-    # Внимание: этот is_mention у тебя был странный (проверял username автора сообщения).
-    # Оставляю как есть, чтобы не ломать логику реакций.
-    is_mention = (
-        message.from_user
-        and message.from_user.username
-        and f"@{message.from_user.username}" in text
-    )
+    # mention/reply to BOT (fixed)
+    bot_id, bot_username = await _get_bot_identity(bot)
+    mention_bot = bool(bot_username) and (f"@{bot_username}" in text_l)
 
-    ctx = await build_context(text)
+    reply_to_bot = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        reply_to_bot = (message.reply_to_message.from_user.id == bot_id)
 
-    ok = True
-    # ok = decide_reply(last_text=text, is_mention=is_mention, context_snippets=ctx)
-    # if not ok:
-    #     return
+    is_mention = mention_bot or reply_to_bot
+
+    # must reply if bot is addressed or owner/defense involved
+    must_reply = is_mention or (mode in ("owner", "defend_owner"))
 
     emoji = pick_reaction(text)
 
-    # --- GIF mode via GIPHY ---
-    if getattr(settings, "GIPHY_API_KEY", ""):
-        p = float(getattr(settings, "GIPHY_PROB", 0.18))
+    # if not must_reply: apply cooldown + probability
+    now = time.time()
+    chat_id = message.chat.id
 
-        # чаще кидаем гифку, когда защищаем владельца
-        if mode == "defend_owner":
-            p = min(0.45, p * 2.0)
+    if not must_reply:
+        last = _last_reply_ts.get(chat_id, 0.0)
+        cooldown = float(getattr(settings, "REPLY_COOLDOWN_SEC", 25))
 
-        if random.random() < p:
-            q = " ".join(text.split()[:5]) or "reaction"
-            gif_url = await search_gif(q)
-            if gif_url:
-                await bot.send_animation(
-                    chat_id=message.chat.id,
-                    animation=gif_url,
-                    reply_to_message_id=message.message_id,
-                )
-                return
+        # cooldown: maybe react and exit
+        if now - last < cooldown:
+            if random.random() < float(getattr(settings, "REACT_PROB_NORMAL", 0.12)):
+                await react(bot, message, emoji)
+            return
 
-    # 1) иногда ТОЛЬКО реакция
-    if should_react_only(is_mention):
-        await react(bot, message, emoji)
-        return
+        # probabilistic reply
+        if random.random() > float(getattr(settings, "REPLY_PROB_NORMAL", 0.08)):
+            if random.random() < float(getattr(settings, "REACT_PROB_NORMAL", 0.12)):
+                await react(bot, message, emoji)
+            return
 
-    # 2) генерим ответ
-    raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "")
-
-    # ✅ нормализуем: если пришёл JSON-блок — достаём content
-    out_text = raw
-    try:
-        import json as _json, re as _re
-        m = _re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=_re.S)
-        if m:
-            obj = _json.loads(m.group(1))
-            out_text = obj.get("content") or obj.get("text") or raw
-    except Exception:
-        pass
-
-    try:
-        await message.reply(out_text)
-    except Exception as e:
-        logging.error(f"send error: {e}")
-
-
-# =========================
-# SPONTANEOUS MODE
-# =========================
-
-async def spontaneous_loop(bot: Bot) -> None:
-    while True:
-        await asyncio.sleep(
-            random.randint(
-                settings.SPONTANEOUS_MIN_SEC,
-                settings.SPONTANEOUS_MAX_SEC,
-            )
-        )
-
-        if random.random() > settings.SPONTANEOUS_PROB:
-            continue
-
-        try:
-            text = generate_reply(
-                user_text="",
-                context_snippets="",
-                mode="normal",
-            ).get("_raw", "")
-
-            if text:
-                await bot.send_message(settings.TARGET_GROUP_ID, text)
-        except Exception as e:
-            logging.debug(f"spontaneous error: {e}")
-
-
-# =========================
-# MAIN
-# =========================
-
-async def main() -> None:
-    bot = Bot(token=settings.BOT_TOKEN)
-
-    global _pg_pool
-    _pg_pool = await asyncpg.create_pool(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-        database=settings.DB_NAME,
-        min_size=1,
-        max_size=5,
-    )
-
-    dp = Dispatcher()
-    dp.message.register(on_text, F.text)
-
-    logging.info("Balbes автономный стартанул")
-
-    asyncio.create_task(spontaneous_loop(bot))
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # OPTIONAL: sometimes react-only even when mentioned (your old logic)
+    if should_react_only(is_mention_
