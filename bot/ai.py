@@ -56,7 +56,7 @@ def decide_reply(last_text: str, is_mention: bool, context_snippets: str) -> boo
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_output_tokens=10,
+        max_output_tokens=32,
     )
     txt = _extract_text_from_responses(r).upper()
     return "YES" in txt and "NO" not in txt
