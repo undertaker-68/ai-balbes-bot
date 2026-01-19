@@ -90,22 +90,26 @@ async def on_text(message: Message, bot: Bot) -> None:
         await react(bot, message, emoji)
         return
 
-    # 2) генерим ответ
+   # 2) генерим ответ
     ctx = await build_context(text)
-    raw = generate_reply(
-        user_text=text,
-        context_snippets=ctx,
-    ).get("_raw", "")
+    raw = generate_reply(user_text=text, context_snippets=ctx).get("_raw", "")
+
+    # ✅ нормализуем: если пришёл JSON-блок — достаём content
+    out_text = raw
+    try:
+        import json, re
+        m = re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=re.S)
+        if m:
+            obj = json.loads(m.group(1))
+            out_text = obj.get("content") or obj.get("text") or raw
+    except Exception:
+        pass
 
     # отправка
     try:
-        await message.reply(raw)
+        await message.reply(out_text)
     except Exception as e:
         logging.error(f"send error: {e}")
-
-    # 3) иногда реакция ПОСЛЕ текста
-    if should_react_alongside_text(is_mention):
-        await react(bot, message, emoji)
 
 
 # =========================
