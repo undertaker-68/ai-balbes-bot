@@ -5,7 +5,7 @@ class Settings(BaseSettings):
 
     # Telegram
     BOT_TOKEN: str
-    OWNER_USER_ID: int
+    OWNER_USER_ID: 1434320989
     TARGET_GROUP_ID: int
     OWNER_ONLY_MODE: bool = True
 
@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     # Media
     TENOR_API_KEY: str = ""
     ASSETS_DIR: str = "/app/assets"
+
+    # как бот будет позиционироваться
+    OWNER_ALIAS = "балбес"  # или имя владельца/ник
+    OWNER_HANDLES = ["balbes", "балбес"]  # слова, по которым его упоминают
+    OWNER_DEFENSE_MODE = True
+
+    # насколько агрессивно лезть
+    DEFEND_ON_MENTION = True       # если упомянули владельца
+    DEFEND_ON_REPLY_TO_OWNER = True
+    ALWAYS_SIDE_WITH_OWNER = True  # в споре с владельцем/про владельца
 
     @property
     def db_dsn(self) -> str:
