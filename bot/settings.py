@@ -6,6 +6,11 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = ""
     TARGET_GROUP_ID: int = 0
 
+    GIPHY_API_KEY: str = ""
+    GIPHY_RATING: str = "r"
+    GIPHY_LANG: str = "ru"
+    GIPHY_PROB: float = 0.18
+
     # --- DB ---
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
