@@ -163,7 +163,7 @@ async def on_text(message: Message, bot: Bot) -> None:
     ctx = await build_context(text)
 
     # ---- optional: sometimes react-only when directly pinged ----
-    if should_react_only(is_mention):
+    if should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         return
 
