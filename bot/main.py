@@ -115,16 +115,20 @@ async def on_text(message: Message, bot: Bot) -> None:
 
     text_l = (text or "").lower()
 
-    # упомянули владельца текстом
     owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
 
-    # ответили на сообщение владельца (если библиотека даёт reply_to_message)
     reply_to_owner = False
     if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None):
-        reply_uid = message.reply_to_message.from_user.id
-        reply_to_owner = (reply_uid == settings.OWNER_USER_ID)
+        reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
 
-    target_owner = (owner_mentioned and settings.DEFEND_ON_MENTION) or (reply_to_owner and settings.DEFEND_ON_REPLY_TO_OWNER)
+    target_owner = owner_mentioned or reply_to_owner
+
+    # режим для генератора
+    mode = "normal"
+    if is_owner:
+        mode = "owner"
+    elif target_owner:
+        mode = "defend_owner"
 
     # сохраняем сообщение (пока пустышка)
     await save_and_index(message)
