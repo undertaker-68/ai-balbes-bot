@@ -12,10 +12,14 @@ class Settings(BaseSettings):
     GIPHY_LANG: str = "ru"
     GIPHY_PROB: float = 0.18
 
-    # --- Reply policy (NEW) ---
-    REPLY_PROB_NORMAL: float = 0.08      # шанс ответить в обычном режиме
-    REPLY_COOLDOWN_SEC: int = 25         # не чаще 1 ответа в N сек на чат
-    REACT_PROB_NORMAL: float = 0.12      # шанс поставить реакцию, если не отвечаем
+    # --- Reply/React gating ---
+    REPLY_PROB_NORMAL: float = 0.08          # шанс ответить на обычный месседж
+    REPLY_COOLDOWN_SEC: int = 25             # не чаще, чем раз в N секунд на чат
+    REACT_PROB_WHEN_SILENT: float = 0.12     # шанс поставить реакцию, если решил молчать
+
+    # При защите владельца/владельце — всегда отвечаем (обычно так и надо)
+    ALWAYS_REPLY_OWNER: bool = True
+    ALWAYS_REPLY_DEFEND_OWNER: bool = True
 
     # --- DB ---
     DB_HOST: str = "localhost"
