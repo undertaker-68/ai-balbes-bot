@@ -1,12 +1,14 @@
 import aiohttp
 from typing import Optional
+
 from bot.settings import settings
 
 BASE = "https://api.giphy.com/v1/gifs"
 
 
 async def _get_json(url: str, params: dict) -> dict:
-    timeout = aiohttp.ClientTimeout(total=4)  # короче, чтобы не стопорить апдейты
+    # Любой сетевой фейл => пустой dict (не падаем)
+    timeout = aiohttp.ClientTimeout(total=6)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.get(url, params=params) as r:
@@ -14,7 +16,6 @@ async def _get_json(url: str, params: dict) -> dict:
                     return {}
                 return await r.json()
     except Exception:
-        # Важно: никаких исключений наружу — иначе aiogram "роняет" update
         return {}
 
 
@@ -24,7 +25,7 @@ def _pick_best_url(gif_obj: dict) -> Optional[str]:
         ("original_mp4", "mp4"),
         ("fixed_height_mp4", "mp4"),
         ("original", "mp4"),
-        ("original", "url"),  # fallback на gif
+        ("original", "url"),
     ]:
         block = images.get(path[0]) or {}
         u = block.get(path[1])
