@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
 
 from .settings import settings
-from .ai import generate_reply
+from .ai import generate_reply, analyze_image
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
 
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 async def save_and_index(message: Message) -> None:
-    """Пишем входящее сообщение в tg_history (как в твоём импортере)."""
+    """Пишем входящее сообщение в tg_history."""
     global _pg_pool
     if _pg_pool is None:
         return
@@ -31,7 +31,6 @@ async def save_and_index(message: Message) -> None:
         chat_id = int(message.chat.id)
         msg_id = int(message.message_id)
 
-        # aiogram Message.date обычно datetime с tz, но на всякий:
         dt = message.date
         if isinstance(dt, datetime) and dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -42,9 +41,15 @@ async def save_and_index(message: Message) -> None:
             from_id = str(message.from_user.id)
             from_name = (message.from_user.full_name or message.from_user.username or "").strip() or None
 
+        # сохраняем текст/подпись; если фото без подписи — отметим, что было фото
         text = (message.text or "").strip()
+        if not text and getattr(message, "caption", None):
+            text = (message.caption or "").strip()
         if not text:
-            return
+            if getattr(message, "photo", None):
+                text = "[photo]"
+            else:
+                return
 
         await _pg_pool.execute(
             """
@@ -59,7 +64,6 @@ async def save_and_index(message: Message) -> None:
 
 
 async def build_context_24h(chat_id: int) -> str:
-    """Память: последние сообщения за 24 часа, обрезанные по длине."""
     global _pg_pool
     if _pg_pool is None:
         return ""
@@ -84,7 +88,6 @@ async def build_context_24h(chat_id: int) -> str:
     if not rows:
         return ""
 
-    # хотим хронологию: старое -> новое
     rows = list(reversed(rows))
 
     max_chars = int(getattr(settings, "MEMORY_24H_MAX_CHARS", 6500))
@@ -116,28 +119,9 @@ async def react(bot: Bot, message: Message, emoji: str) -> None:
         logging.debug(f"reaction error: {e}")
 
 
-async def on_text(message: Message, bot: Bot) -> None:
-    # работаем только в целевой группе
-    if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
-        return
+def _owner_defense_mode_for_text(text: str, message: Message) -> str:
+    text_l = (text or "").lower()
 
-    text = (message.text or "").strip()
-    if not text:
-        return
-
-    uid = message.from_user.id if message.from_user else None
-    is_owner = (uid == settings.OWNER_USER_ID)
-
-    # сохраняем ВСЁ в память
-    await save_and_index(message)
-
-    # владелец пишет — бот молчит (по твоему требованию)
-    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
-        return
-
-    text_l = text.lower()
-
-    # режим защиты владельца
     owner_mentioned = False
     if settings.OWNER_DEFENSE_MODE and settings.DEFEND_ON_MENTION:
         owner_mentioned = any(h.lower() in text_l for h in getattr(settings, "OWNER_HANDLES", []))
@@ -147,42 +131,79 @@ async def on_text(message: Message, bot: Bot) -> None:
         if message.reply_to_message and message.reply_to_message.from_user:
             reply_to_owner = (message.reply_to_message.from_user.id == settings.OWNER_USER_ID)
 
-    mode = "defend_owner" if (owner_mentioned or reply_to_owner) else "normal"
+    return "defend_owner" if (owner_mentioned or reply_to_owner) else "normal"
 
-    # упоминание бота / reply-to-bot => отвечаем всегда
+
+async def _compute_is_mention(bot: Bot, message: Message, text: str) -> bool:
     me = await bot.get_me()
     bot_username = (me.username or "").lower()
     bot_id = me.id
 
+    text_l = (text or "").lower()
     mention_bot = bool(bot_username) and (f"@{bot_username}" in text_l)
-    reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_id)
-    is_mention = mention_bot or reply_to_bot
+    reply_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == bot_id
+    )
+    return mention_bot or reply_to_bot
 
-    # антиспам + вероятность (но почти всегда)
+
+async def _gate_reply(bot: Bot, message: Message, mode: str, is_mention: bool, emoji: str) -> bool:
+    """
+    Возвращает True если надо отвечать (текст/гиф/vision).
+    Если False — иногда ставит реакцию и молчит.
+    """
+    uid = message.from_user.id if message.from_user else None
+    is_owner = (uid == settings.OWNER_USER_ID)
+
+    # владелец пишет — бот молчит (по твоему требованию)
+    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+        return False
+
     now = time.time()
     chat_id = int(message.chat.id)
-    emoji = pick_reaction(text)
 
     must_reply = is_mention or (mode == "defend_owner")
+    if must_reply:
+        return True
 
-    if not must_reply:
-        last = _last_reply_ts.get(chat_id, 0.0)
-        if now - last < float(getattr(settings, "REPLY_COOLDOWN_SEC", 8)):
-            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
-                await react(bot, message, emoji)
-            return
+    last = _last_reply_ts.get(chat_id, 0.0)
+    if now - last < float(getattr(settings, "REPLY_COOLDOWN_SEC", 8)):
+        if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
+            await react(bot, message, emoji)
+        return False
 
-        if random.random() > float(getattr(settings, "REPLY_PROB_NORMAL", 0.92)):
-            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
-                await react(bot, message, emoji)
-            return
+    if random.random() > float(getattr(settings, "REPLY_PROB_NORMAL", 0.92)):
+        if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
+            await react(bot, message, emoji)
+        return False
 
-    _last_reply_ts[chat_id] = now
+    return True
 
-    # память за 24 часа
-    ctx = await build_context_24h(chat_id)
 
-    # иногда только реакция (как человек), особенно если тегнули бота
+async def on_text(message: Message, bot: Bot) -> None:
+    if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    await save_and_index(message)
+
+    mode = _owner_defense_mode_for_text(text, message)
+    emoji = pick_reaction(text)
+    is_mention = await _compute_is_mention(bot, message, text)
+
+    should = await _gate_reply(bot, message, mode, is_mention, emoji)
+    if not should:
+        return
+
+    _last_reply_ts[int(message.chat.id)] = time.time()
+
+    ctx = await build_context_24h(int(message.chat.id))
+
     if should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         return
@@ -195,7 +216,7 @@ async def on_text(message: Message, bot: Bot) -> None:
 
         if random.random() < p:
             q = " ".join(text.split()[:5]) or "reaction"
-            gif_url = await search_gif(q)  # у тебя giphy.py уже “не падает”
+            gif_url = await search_gif(q)
             if gif_url:
                 try:
                     await bot.send_animation(
@@ -207,18 +228,88 @@ async def on_text(message: Message, bot: Bot) -> None:
                 except Exception as e:
                     logging.debug(f"send_animation error: {e}")
 
-    # текстовый ответ
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "")
-    out_text = raw
+    try:
+        await message.reply(raw)
+    except Exception as e:
+        logging.error(f"send error: {e}")
+
+
+async def on_photo(message: Message, bot: Bot) -> None:
+    # вариант A: если есть подпись — анализируем всегда; если нет — иногда
+    if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
+        return
+    if not message.photo:
+        return
+
+    await save_and_index(message)
+
+    caption = (message.caption or "").strip()
+    mode = _owner_defense_mode_for_text(caption, message) if caption else "normal"
+    emoji = pick_reaction(caption or "photo")
+    is_mention = await _compute_is_mention(bot, message, caption or "")
+
+    # владелец прислал фото — молчим (но в память записали)
+    uid = message.from_user.id if message.from_user else None
+    if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+        return
+
+    should = await _gate_reply(bot, message, mode, is_mention, emoji)
+    if not should:
+        return
+
+    # Если подписи нет — комментим только иногда (чтобы не быть навязчивым)
+    if not caption:
+        if random.random() > 0.35:
+            # иногда просто реакция
+            if random.random() < float(getattr(settings, "REACT_PROB_WHEN_SILENT", 0.35)):
+                await react(bot, message, emoji)
+            return
+
+    _last_reply_ts[int(message.chat.id)] = time.time()
+
+    ctx = await build_context_24h(int(message.chat.id))
+
+    # скачиваем картинку
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buf = await bot.download_file(file.file_path)
+        image_bytes = buf.read()
+    except Exception as e:
+        logging.debug(f"download photo error: {e}")
+        # fallback: хотя бы текстом
+        raw = generate_reply(
+            user_text=(caption or "на фотке что-то, но я не смог скачать"),
+            context_snippets=ctx,
+            mode=mode,
+        ).get("_raw", "")
+        await message.reply(raw)
+        return
+
+    # анализ vision
+    try:
+        raw = analyze_image(
+            image_bytes=image_bytes,
+            caption_text=caption,
+            context_snippets=ctx,
+            mode=mode,
+        ).get("_raw", "")
+    except Exception as e:
+        logging.debug(f"vision error: {e}")
+        raw = generate_reply(
+            user_text=(caption or "чё за картинка вообще"),
+            context_snippets=ctx,
+            mode=mode,
+        ).get("_raw", "")
 
     try:
-        await message.reply(out_text)
+        await message.reply(raw)
     except Exception as e:
         logging.error(f"send error: {e}")
 
 
 async def spontaneous_loop(bot: Bot) -> None:
-    """Иногда сам начинает разговор (в пределах заданной вероятности)."""
     while True:
         await asyncio.sleep(
             random.randint(
@@ -231,7 +322,8 @@ async def spontaneous_loop(bot: Bot) -> None:
             continue
 
         try:
-            text = generate_reply(user_text="", context_snippets=await build_context_24h(int(settings.TARGET_GROUP_ID)), mode="normal").get("_raw", "")
+            ctx = await build_context_24h(int(settings.TARGET_GROUP_ID))
+            text = generate_reply(user_text="", context_snippets=ctx, mode="normal").get("_raw", "")
             if text:
                 await bot.send_message(int(settings.TARGET_GROUP_ID), text)
         except Exception as e:
@@ -254,6 +346,7 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.message.register(on_text, F.text)
+    dp.message.register(on_photo, F.photo)
 
     logging.info("Balbes автономный стартанул")
 
