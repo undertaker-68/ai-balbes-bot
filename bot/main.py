@@ -72,15 +72,16 @@ async def on_text(message: Message, bot: Bot) -> None:
     )
 
     ctx = await build_context(text)
+    
+    ok = True
+    #ok = decide_reply(
+    #    last_text=text,
+    #    is_mention=is_mention,
+    #    context_snippets=ctx,
+   # )
 
-    ok = decide_reply(
-        last_text=text,
-        is_mention=is_mention,
-        context_snippets=ctx,
-    )
-
-    if not ok:
-        return
+  #  if not ok:
+   #     return
 
     emoji = pick_reaction(text)
 
