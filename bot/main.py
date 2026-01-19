@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import asyncpg
+import re
 import logging
 import random
 from datetime import datetime
@@ -15,6 +17,8 @@ from .reactions import (
     should_react_only,
     should_react_alongside_text,
 )
+
+_pg_pool: asyncpg.Pool | None = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,16 +35,60 @@ async def save_and_index(message: Message) -> None:
     return
 
 
+def _keywords(s: str) -> str:
+    # берём слова длиннее 2 символов, ограничим 8
+    ws = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", s.lower())
+    ws = ws[:8]
+    return " ".join(ws)
+
 async def build_context(user_text: str) -> str:
-    """
-    Временно без памяти.
-    """
-    return ""
+    global _pg_pool
+    if _pg_pool is None:
+        return ""
 
+    q = _keywords(user_text)
+    if not q:
+        return ""
 
-# =========================
-# REACTIONS
-# =========================
+    # FTS: ищем топ релевантных
+    rows = await _pg_pool.fetch(
+        """
+        SELECT dt, from_name, text
+        FROM tg_history
+        WHERE chat_id = $1
+          AND to_tsvector('russian', coalesce(text,'')) @@ plainto_tsquery('russian', $2)
+        ORDER BY dt DESC
+        LIMIT 20
+        """,
+        settings.TARGET_GROUP_ID,
+        q,
+    )
+
+    if not rows:
+        # запасной вариант: ILIKE по фразе (если FTS ничего не нашёл)
+        rows = await _pg_pool.fetch(
+            """
+            SELECT dt, from_name, text
+            FROM tg_history
+            WHERE chat_id = $1
+              AND text ILIKE '%' || $2 || '%'
+            ORDER BY dt DESC
+            LIMIT 10
+            """,
+            settings.TARGET_GROUP_ID,
+            user_text[:64],
+        )
+
+    # форматируем “воспоминания”
+    parts = []
+    for r in rows:
+        dt = r["dt"].isoformat() if r["dt"] else ""
+        frm = r["from_name"] or "кто-то"
+        txt = (r["text"] or "").strip()
+        txt = txt[:300]
+        parts.append(f"{dt} — {frm}: {txt}")
+
+    return "\n".join(parts)
 
 async def react(bot: Bot, message: Message, emoji: str) -> None:
     try:
@@ -146,6 +194,17 @@ async def spontaneous_loop(bot: Bot) -> None:
 
 async def main() -> None:
     bot = Bot(token=settings.BOT_TOKEN)
+    global _pg_pool
+    _pg_pool = await asyncpg.create_pool(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+        database=settings.DB_NAME,
+        min_size=1,
+        max_size=5,
+    )
+
     dp = Dispatcher()
 
     dp.message.register(on_text, F.text)
