@@ -15,6 +15,9 @@ from .ai import generate_reply, analyze_image, clean_llm_output, is_garbage_text
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
 
+from aiogram.types import BufferedInputFile
+from .services.tts import tts_to_ogg_opus
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -316,6 +319,10 @@ async def _gate_reply(
 
     return True
 
+def wants_voice(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    return any(k in t for k in ["голосом", "озвуч", "запиши войс", "войсом", "voice"])
+
 
 # -------------------- Handlers --------------------
 
@@ -402,6 +409,11 @@ async def on_text(message: Message, bot: Bot) -> None:
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
+    if wants_voice(text):
+        audio = await tts_to_ogg_opus(raw)
+        vf = BufferedInputFile(audio, filename="voice.ogg")
+        await bot.send_voice(chat_id=message.chat.id, voice=vf)
+    return
 
     if (not raw) or is_garbage_text(raw):
         # мусор не шлём
