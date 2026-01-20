@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
 
 from .settings import settings
-from .ai import generate_reply, analyze_image
+from .ai import generate_reply, analyze_image, clean_llm_output, is_garbage_text
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
 
@@ -46,7 +46,6 @@ async def save_and_index(message: Message) -> None:
             from_id = str(message.from_user.id)
             from_name = (message.from_user.full_name or message.from_user.username or "").strip() or None
 
-        # text/caption; если нет — отметим тип
         text = (message.text or "").strip()
         if not text and getattr(message, "caption", None):
             text = (message.caption or "").strip()
@@ -122,7 +121,6 @@ async def build_context_24h(chat_id: int) -> str:
 
 
 async def build_user_context_24h(chat_id: int, user_id: int) -> str:
-    """Персональная память: что этот участник писал за 24 часа (коротко)."""
     global _pg_pool
     if _pg_pool is None:
         return ""
@@ -219,7 +217,6 @@ def _owner_defense_mode_for_text(text: str, message: Message) -> str:
 
 
 async def _compute_is_mention(bot: Bot, message: Message, text: str) -> tuple[bool, int, str]:
-    """Возвращает (is_mention, bot_id, bot_username_lower)."""
     me = await bot.get_me()
     bot_username = (me.username or "").lower()
     bot_id = me.id
@@ -235,22 +232,17 @@ async def _compute_is_mention(bot: Bot, message: Message, text: str) -> tuple[bo
 
 
 def _strip_self_mention(text: str, bot_username_lower: str) -> str:
-    """Чтобы бот не писал '@master_ebaka_bot' в своих сообщениях."""
     if not text:
         return text
     if not bot_username_lower:
         return text
 
-    # убираем все варианты регистра
     handle = "@" + bot_username_lower
     out = text.replace(handle, "")
-    # на всякий, если модель вставила с другим регистром — грубо вырежем по lower
-    # (без regex, чтобы не усложнять)
     while handle in out.lower():
         i = out.lower().find(handle)
-        out = out[:i] + out[i+len(handle):]
+        out = out[:i] + out[i + len(handle):]
 
-    # подчистим двойные пробелы
     out = " ".join(out.split())
     return out.strip()
 
@@ -264,28 +256,23 @@ async def _gate_reply(
     emoji: str,
     bot_id: int,
 ) -> bool:
-    """
-    True -> отвечаем (текст/гиф/vision)
-    False -> молчим (иногда реакция)
-    """
-
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
-    # не отвечаем сами себе вообще
+    # не отвечаем сами себе
     if uid is not None and uid == bot_id:
-        return False
-
-    # владелец: молчим, НО если позвал бота (mention/reply) — отвечаем
-    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return False
 
     now = time.time()
     chat_id = int(message.chat.id)
 
-    # если мы уже ведём диалог с этим человеком — отвечаем почти всегда
+    # ✅ диалог-окно имеет приоритет (включая владельца)
     if uid is not None and _dialog_is_active(chat_id, uid):
         return True
+
+    # владелец: молчим, НО если позвал бота — отвечаем
+    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
+        return False
 
     must_reply = is_mention or (mode == "defend_owner")
     if must_reply:
@@ -315,13 +302,10 @@ async def on_text(message: Message, bot: Bot) -> None:
     if not text:
         return
 
-    # сохраняем в память
     await save_and_index(message)
 
-    # вычисляем упоминание и bot_id (нужно для анти-self и для owner-exception)
     is_mention, bot_id, bot_username_lower = await _compute_is_mention(bot, message, text)
 
-    # не отвечаем сами себе
     uid = message.from_user.id if message.from_user else None
     if uid is not None and uid == bot_id:
         return
@@ -342,7 +326,6 @@ async def on_text(message: Message, bot: Bot) -> None:
 
     _last_reply_ts[int(message.chat.id)] = time.time()
 
-    # контекст чата + контекст этого участника
     ctx = await build_context_24h(int(message.chat.id))
     user_ctx = ""
     if uid is not None:
@@ -350,8 +333,7 @@ async def on_text(message: Message, bot: Bot) -> None:
     if user_ctx:
         ctx = ctx + "\n\n[ЛИЧНЫЙ КОНТЕКСТ ЭТОГО УЧАСТНИКА ЗА 24Ч]\n" + user_ctx
 
-    # иногда только реакция (реже, чтобы не бесить)
-    # Если бота позвали — НЕ делаем react-only, обязательно отвечаем текстом
+    # ✅ На mention/reply — НИКОГДА не react-only
     if (not is_mention) and should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         if uid is not None:
@@ -385,14 +367,19 @@ async def on_text(message: Message, bot: Bot) -> None:
                 except Exception as e:
                     log.debug(f"send_animation error: {e}")
 
+    # если владелец позвал — задаём цель
     if uid == settings.OWNER_USER_ID and is_mention:
-        ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его подкол/линию наезда на оппонента. Держи тему 2-4 реплики."
+        mode = "defend_owner"
+        ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его линию. Держи тему 2-4 реплики."
 
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
 
-    if not raw:
+    # ✅ если мусор/пусто — в чат не шлём
+    if (not raw) or is_garbage_text(raw):
+        if random.random() < 0.45:
+            await react(bot, message, emoji)
         return
 
     try:
@@ -409,27 +396,25 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if not message.photo:
         return
 
-    # сохраняем в память
     await save_and_index(message)
 
     caption = (message.caption or "").strip()
-
-    # вычисляем is_mention заранее (иначе owner-check ломается)
     is_mention, bot_id, bot_username_lower = await _compute_is_mention(bot, message, caption or "")
 
     uid = message.from_user.id if message.from_user else None
-    # не отвечаем сами себе
     if uid is not None and uid == bot_id:
         return
 
-    # владелец: молчим, НО если позвал бота — отвечаем
+    # владелец: молчим, НО если позвал — отвечаем
     if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return
 
     mode = _owner_defense_mode_for_text(caption, message) if caption else "normal"
+    if uid == settings.OWNER_USER_ID and is_mention:
+        mode = "defend_owner"
+
     emoji = pick_reaction(caption or "photo")
 
-    # фото: отвечаем всегда (как ты просил), без вероятностей.
     _last_reply_ts[int(message.chat.id)] = time.time()
 
     ctx = await build_context_24h(int(message.chat.id))
@@ -451,13 +436,17 @@ async def on_photo(message: Message, bot: Bot) -> None:
         raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
         raw = clean_llm_output(raw)
         raw = _strip_self_mention(raw, bot_username_lower)
-        if raw:
-            await message.reply(raw)
-            if uid is not None:
-                _dialog_touch(int(message.chat.id), uid)
+
+        if (not raw) or is_garbage_text(raw):
+            await react(bot, message, emoji)
+            return
+
+        await message.reply(raw)
+        if uid is not None:
+            _dialog_touch(int(message.chat.id), uid)
         return
 
-    # vision анализ
+    # vision
     try:
         raw = analyze_image(
             image_bytes=image_bytes,
@@ -470,13 +459,14 @@ async def on_photo(message: Message, bot: Bot) -> None:
         fallback_text = caption or "ну и что это за фотка вообще"
         raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
 
+    raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
 
-    if not raw:
+    if (not raw) or is_garbage_text(raw):
+        await react(bot, message, emoji)
         return
 
-    # редко реакция вместе с ответом
-    if random.random() < 0.12:
+    if random.random() < 0.10:
         await react(bot, message, emoji)
 
     try:
@@ -505,13 +495,17 @@ async def spontaneous_loop(bot: Bot) -> None:
             ctx = await build_context_24h(int(settings.TARGET_GROUP_ID))
             text = generate_reply(user_text="", context_snippets=ctx, mode="normal").get("_raw", "").strip()
 
-            # На всякий: не дай боту упомянуть самого себя
             me = await bot.get_me()
             bot_username_lower = (me.username or "").lower()
+
+            text = clean_llm_output(text)
             text = _strip_self_mention(text, bot_username_lower)
 
-            if text:
-                await bot.send_message(int(settings.TARGET_GROUP_ID), text)
+            if (not text) or is_garbage_text(text):
+                continue
+
+            await bot.send_message(int(settings.TARGET_GROUP_ID), text)
+
         except Exception as e:
             log.debug(f"spontaneous error: {e}")
 
