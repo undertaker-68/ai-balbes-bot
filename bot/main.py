@@ -357,13 +357,15 @@ async def on_text(message: Message, bot: Bot) -> None:
     # ✅ картинка по запросу
     if wants_image(text):
         prompt = text.replace("@" + bot_username_lower, "").strip()
+        
         img = await asyncio.to_thread(generate_image_bytes, prompt)
-            if img:
-                photo = BufferedInputFile(img, filename="image.png")
-                await bot.send_photo(chat_id=message.chat.id, photo=photo)
-                if uid is not None:
-                    _dialog_touch(int(message.chat.id), uid)
-                return
+        if img:
+            photo = BufferedInputFile(img, filename="image.png")
+            await bot.send_photo(chat_id=message.chat.id, photo=photo)
+            if uid is not None:
+               _dialog_touch(int(message.chat.id), uid)
+            return
+            
             if uid is not None:
                 _dialog_touch(int(message.chat.id), uid)
             return
