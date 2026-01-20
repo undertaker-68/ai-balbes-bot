@@ -29,6 +29,28 @@ _dialog_state: dict[tuple[int, int], tuple[float, int]] = {}
 _last_spontaneous_ts: dict[int, float] = {}
 _last_seen_chat_activity_ts: dict[int, float] = {}
 
+_bigbuf: dict[tuple[int,int], dict] = {}
+
+async def collect_big_message(chat_id: int, user_id: int, piece: str, wait_sec: int = 35) -> str:
+    key = (chat_id, user_id)
+    now = time.time()
+    st = _bigbuf.get(key)
+
+    if not st:
+        st = {"parts": [], "deadline": now + wait_sec}
+        _bigbuf[key] = st
+
+    st["parts"].append(piece)
+
+    # ждём пока пользователь докидывает куски
+    while True:
+        await asyncio.sleep(1.0)
+        if time.time() >= st["deadline"]:
+            break
+
+    out = "\n".join(st["parts"]).strip()
+    _bigbuf.pop(key, None)
+    return out
 
 async def save_and_index(message: Message) -> None:
     global _pg_pool
@@ -320,6 +342,9 @@ async def on_text(message: Message, bot: Bot) -> None:
     _last_seen_chat_activity_ts[int(message.chat.id)] = time.time()
 
     text = (message.text or "").strip()
+    if len(text) > 3500:  # простыня
+        uid = message.from_user.id if message.from_user else 0
+        text = await collect_big_message(int(message.chat.id), uid, text, wait_sec=35)
     if not text:
         return
 
@@ -406,6 +431,8 @@ async def on_text(message: Message, bot: Bot) -> None:
         mode = "defend_owner"
         ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его линию. Держи тему 2-4 реплики."
 
+    max_in = int(getattr(settings, "MAX_INPUT_CHARS", 20000))
+    text_for_model = text[:max_in]
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
