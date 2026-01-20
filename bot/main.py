@@ -16,7 +16,7 @@ from .ai import generate_reply, analyze_image, clean_llm_output, is_garbage_text
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
 from .services.tts import tts_to_ogg_opus_random
-from .services.image_gen import generate_image_url
+from .services.image_gen import generate_image_bytes
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -357,9 +357,13 @@ async def on_text(message: Message, bot: Bot) -> None:
     # ✅ картинка по запросу
     if wants_image(text):
         prompt = text.replace("@" + bot_username_lower, "").strip()
-        img_url = await generate_image_url(prompt)
-        if img_url:
-            await bot.send_photo(chat_id=message.chat.id, photo=img_url)
+        img = await asyncio.to_thread(generate_image_bytes, prompt)
+            if img:
+                photo = BufferedInputFile(img, filename="image.png")
+                await bot.send_photo(chat_id=message.chat.id, photo=photo)
+                if uid is not None:
+                    _dialog_touch(int(message.chat.id), uid)
+                return
             if uid is not None:
                 _dialog_touch(int(message.chat.id), uid)
             return
