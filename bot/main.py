@@ -386,7 +386,7 @@ async def on_text(message: Message, bot: Bot) -> None:
                     log.debug(f"send_animation error: {e}")
 
     if uid == settings.OWNER_USER_ID and is_mention:
-    ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его подкол/линию наезда на оппонента. Держи тему 2-4 реплики."
+        ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его подкол/линию наезда на оппонента. Держи тему 2-4 реплики."
 
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
     raw = _strip_self_mention(raw, bot_username_lower)
