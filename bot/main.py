@@ -351,9 +351,9 @@ async def on_text(message: Message, bot: Bot) -> None:
         ctx = ctx + "\n\n[ЛИЧНЫЙ КОНТЕКСТ ЭТОГО УЧАСТНИКА ЗА 24Ч]\n" + user_ctx
 
     # иногда только реакция (реже, чтобы не бесить)
-    if should_react_only(is_mention, mode):
+    # Если бота позвали — НЕ делаем react-only, обязательно отвечаем текстом
+    if (not is_mention) and should_react_only(is_mention, mode):
         await react(bot, message, emoji)
-        # но диалог можно “поддержать” реакцией
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
         return
