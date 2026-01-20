@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     DEFEND_ON_MENTION: bool = True
     DEFEND_ON_REPLY_TO_OWNER: bool = True
 
+    USE_TELEGRAM_REPLY: bool = False
+
     # DB
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
