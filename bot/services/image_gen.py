@@ -90,6 +90,8 @@ def generate_image_bytes(prompt: str, *, timeout_sec: int = 90) -> Optional[byte
             modalities=["image", "text"],
             timeout=timeout_sec,
             extra_headers=headers if headers else None,
+            max_tokens=64,
+            temperature=0.9,
         )
 
         msg = resp.choices[0].message
