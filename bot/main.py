@@ -157,8 +157,8 @@ async def _gate_reply(bot: Bot, message: Message, mode: str, is_mention: bool, e
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
-    # владелец пишет — бот молчит (по твоему требованию)
-    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+    # владелец пишет — бот молчит, НО если вызвал бота (mention/reply) — отвечаем
+    if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return False
 
     now = time.time()
@@ -246,7 +246,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
     # владельцу не отвечаем
     uid = message.from_user.id if message.from_user else None
-    if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)):
+    if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return
 
     caption = (message.caption or "").strip()
