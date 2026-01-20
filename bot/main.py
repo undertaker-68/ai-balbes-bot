@@ -359,7 +359,6 @@ async def on_text(message: Message, bot: Bot) -> None:
                     await bot.send_animation(
                         chat_id=message.chat.id,
                         animation=gif_url,
-                        reply_to_message_id=message.message_id,
                     )
                     if uid is not None:
                         _dialog_touch(int(message.chat.id), uid)
@@ -383,7 +382,7 @@ async def on_text(message: Message, bot: Bot) -> None:
         return
 
     try:
-        await message.reply(raw)
+        await bot.send_message(chat_id=message.chat.id, text=raw)
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
     except Exception as e:
@@ -441,7 +440,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
             await react(bot, message, emoji)
             return
 
-        await message.reply(raw)
+        await bot.send_message(chat_id=message.chat.id, text=raw)
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
         return
