@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     OPENROUTER_TEXT_MODEL: str = "meta-llama/llama-3.1-70b-instruct"
     OPENROUTER_TEXT_FALLBACKS: str = "meta-llama/llama-3.1-8b-instruct,mistralai/mixtral-8x7b-instruct"
 
+    # Image generation (OpenRouter)
+    OPENROUTER_IMAGE_MODEL: str = "google/gemini-2.5-flash-image"
+
     # ВАЖНО: vision модель должна поддерживать картинки
     OPENROUTER_VISION_MODEL: str = "qwen/qwen2.5-vl-72b-instruct"
     OPENROUTER_VISION_FALLBACKS: str = "qwen/qwen2-vl-72b-instruct"
