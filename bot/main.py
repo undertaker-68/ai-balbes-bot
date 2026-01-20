@@ -15,13 +15,17 @@ from .ai import generate_reply, analyze_image, clean_llm_output, is_garbage_text
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
 _pg_pool: asyncpg.Pool | None = None
 
 _last_reply_ts: dict[int, float] = {}
 _dialog_state: dict[tuple[int, int], tuple[float, int]] = {}  # (chat_id, user_id) -> (until_ts, streak)
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+# анти-спам спонтанных сообщений
+_last_spontaneous_ts: dict[int, float] = {}        # chat_id -> ts
+_last_seen_chat_activity_ts: dict[int, float] = {} # chat_id -> ts
 
 
 # -------------------- DB save --------------------
@@ -247,6 +251,20 @@ def _strip_self_mention(text: str, bot_username_lower: str) -> str:
     return out.strip()
 
 
+def _soft_address_prefix(message: Message) -> str:
+    """Без reply-веток — иногда добавляем имя, чтобы было понятно, кому ответ."""
+    if not message.from_user:
+        return ""
+    # не всегда, чтобы не выглядело как бот-саппорт
+    if random.random() < 0.55:
+        return ""
+    name = (message.from_user.first_name or message.from_user.full_name or "").strip()
+    if not name:
+        return ""
+    # короткое обращение
+    return f"{name}, "
+
+
 async def _gate_reply(
     *,
     bot: Bot,
@@ -263,11 +281,18 @@ async def _gate_reply(
     if uid is not None and uid == bot_id:
         return False
 
-    now = time.time()
     chat_id = int(message.chat.id)
+    now = time.time()
 
-    # ✅ диалог-окно имеет приоритет (включая владельца)
+    # диалог-окно имеет приоритет (включая владельца)
     if uid is not None and _dialog_is_active(chat_id, uid):
+        # на супер-короткие "угу/вот/ваще" отвечаем реже, но не запрещаем
+        t = (message.text or "").strip().lower()
+        if t in {"угу", "ага", "вот", "ваще", "ок", "ясно", "пон", "ну"} or len(t) <= 3:
+            if random.random() < 0.70:
+                if random.random() < 0.45:
+                    await react(bot, message, emoji)
+                return False
         return True
 
     # владелец: молчим, НО если позвал бота — отвечаем
@@ -297,6 +322,9 @@ async def _gate_reply(
 async def on_text(message: Message, bot: Bot) -> None:
     if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
         return
+
+    # отметим активность
+    _last_seen_chat_activity_ts[int(message.chat.id)] = time.time()
 
     text = (message.text or "").strip()
     if not text:
@@ -333,18 +361,18 @@ async def on_text(message: Message, bot: Bot) -> None:
     if user_ctx:
         ctx = ctx + "\n\n[ЛИЧНЫЙ КОНТЕКСТ ЭТОГО УЧАСТНИКА ЗА 24Ч]\n" + user_ctx
 
-    # ✅ На mention/reply — НИКОГДА не react-only
+    # На mention/reply — НИКОГДА не react-only
     if (not is_mention) and should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
         return
 
-    # иногда гифка
+    # иногда гифка (без reply_to_message_id, чтобы не засорять ветками)
     if getattr(settings, "GIPHY_API_KEY", ""):
         p = float(getattr(settings, "GIPHY_PROB", 0.22))
         if mode == "defend_owner":
-            p = min(0.45, p * 1.6)
+            p = min(0.40, p * 1.4)
 
         if random.random() < p:
             q = " ".join(text.split()[:5]) or "reaction"
@@ -366,7 +394,7 @@ async def on_text(message: Message, bot: Bot) -> None:
                 except Exception as e:
                     log.debug(f"send_animation error: {e}")
 
-    # если владелец позвал — задаём цель
+    # если владелец позвал — защита + цель
     if uid == settings.OWNER_USER_ID and is_mention:
         mode = "defend_owner"
         ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его линию. Держи тему 2-4 реплики."
@@ -375,18 +403,20 @@ async def on_text(message: Message, bot: Bot) -> None:
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
 
-    # ✅ если мусор/пусто — в чат не шлём
     if (not raw) or is_garbage_text(raw):
+        # мусор не шлём
         if random.random() < 0.45:
             await react(bot, message, emoji)
         return
 
+    # без reply-веток: отправляем обычным сообщением
+    prefix = _soft_address_prefix(message)
     try:
-        await bot.send_message(chat_id=message.chat.id, text=raw)
+        await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
     except Exception as e:
-        log.error(f"send error: {e}")
+        log.error(f"send_message error: {e}")
 
 
 async def on_photo(message: Message, bot: Bot) -> None:
@@ -394,6 +424,9 @@ async def on_photo(message: Message, bot: Bot) -> None:
         return
     if not message.photo:
         return
+
+    # отметим активность
+    _last_seen_chat_activity_ts[int(message.chat.id)] = time.time()
 
     await save_and_index(message)
 
@@ -413,7 +446,6 @@ async def on_photo(message: Message, bot: Bot) -> None:
         mode = "defend_owner"
 
     emoji = pick_reaction(caption or "photo")
-
     _last_reply_ts[int(message.chat.id)] = time.time()
 
     ctx = await build_context_24h(int(message.chat.id))
@@ -431,6 +463,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
         image_bytes = buf.read()
     except Exception as e:
         log.debug(f"download photo error: {e}")
+        # fallback на текстовый ответ
         fallback_text = caption or "чё за фотка, не прогрузилась"
         raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
         raw = clean_llm_output(raw)
@@ -440,7 +473,8 @@ async def on_photo(message: Message, bot: Bot) -> None:
             await react(bot, message, emoji)
             return
 
-        await bot.send_message(chat_id=message.chat.id, text=raw)
+        prefix = _soft_address_prefix(message)
+        await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
         return
@@ -468,30 +502,47 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if random.random() < 0.10:
         await react(bot, message, emoji)
 
+    prefix = _soft_address_prefix(message)
     try:
-        await message.reply(raw)
+        await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
     except Exception as e:
-        log.error(f"send error: {e}")
+        log.error(f"send_message error: {e}")
 
 
-# -------------------- Spontaneous --------------------
+# -------------------- Spontaneous (max 1 per hour) --------------------
 
 async def spontaneous_loop(bot: Bot) -> None:
+    chat_id = int(settings.TARGET_GROUP_ID)
+
     while True:
         await asyncio.sleep(
             random.randint(
-                int(getattr(settings, "SPONTANEOUS_MIN_SEC", 180)),
-                int(getattr(settings, "SPONTANEOUS_MAX_SEC", 540)),
+                int(getattr(settings, "SPONTANEOUS_MIN_SEC", 600)),   # раз в 10-20 минут проверяем
+                int(getattr(settings, "SPONTANEOUS_MAX_SEC", 1200)),
             )
         )
 
         if random.random() > float(getattr(settings, "SPONTANEOUS_PROB", 0.12)):
             continue
 
+        now = time.time()
+
+        # максимум 1 сообщение в час
+        cooldown = int(getattr(settings, "SPONTANEOUS_COOLDOWN_SEC", 3600))
+        last_sp = _last_spontaneous_ts.get(chat_id, 0.0)
+        if now - last_sp < cooldown:
+            continue
+
+        # только если чат молчит N секунд
+        silent_need = int(getattr(settings, "SPONTANEOUS_ONLY_IF_SILENT_SEC", 600))
+        last_act = _last_seen_chat_activity_ts.get(chat_id, 0.0)
+        if last_act and (now - last_act) < silent_need:
+            continue
+
         try:
-            ctx = await build_context_24h(int(settings.TARGET_GROUP_ID))
+            ctx = await build_context_24h(chat_id)
             text = generate_reply(user_text="", context_snippets=ctx, mode="normal").get("_raw", "").strip()
 
             me = await bot.get_me()
@@ -503,7 +554,8 @@ async def spontaneous_loop(bot: Bot) -> None:
             if (not text) or is_garbage_text(text):
                 continue
 
-            await bot.send_message(int(settings.TARGET_GROUP_ID), text)
+            await bot.send_message(chat_id, text)
+            _last_spontaneous_ts[chat_id] = now
 
         except Exception as e:
             log.debug(f"spontaneous error: {e}")
