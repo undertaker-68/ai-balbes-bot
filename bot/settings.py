@@ -22,10 +22,24 @@ class Settings(BaseSettings):
     DB_USER: str = "balbes"
     DB_PASSWORD: str = "balbes"
 
-    # OpenAI
+    # OpenAI (оставляем как запасной вариант, но можно не использовать)
     OPENAI_API_KEY: str = ""
     OPENAI_TEXT_MODEL: str = "gpt-4o-mini"
-    OPENAI_MAX_TOKENS: int = 180  # короче ответы
+    OPENAI_MAX_TOKENS: int = 180
+
+    # OpenRouter (основной провайдер)
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_APP_NAME: str = "ai-balbes-bot"
+    OPENROUTER_SITE_URL: str = ""
+
+    # модели
+    OPENROUTER_TEXT_MODEL: str = "meta-llama/llama-3.1-70b-instruct"
+    OPENROUTER_TEXT_FALLBACKS: str = "meta-llama/llama-3.1-8b-instruct,mistralai/mixtral-8x7b-instruct"
+
+    # ВАЖНО: vision модель должна поддерживать картинки
+    OPENROUTER_VISION_MODEL: str = "qwen/qwen2.5-vl-72b-instruct"
+    OPENROUTER_VISION_FALLBACKS: str = "qwen/qwen2-vl-72b-instruct"
 
     # GIPHY
     GIPHY_API_KEY: str = ""
