@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     SPONTANEOUS_PROB: float = 0.12
     SPONTANEOUS_MIN_SEC: int = 180
     SPONTANEOUS_MAX_SEC: int = 540
+    SPONTANEOUS_COOLDOWN_SEC: int = 3600
+    SPONTANEOUS_ONLY_IF_SILENT_SEC: int = 600
 
     class Config:
         env_file = ".env"
