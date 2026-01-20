@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import base64
 import time
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from openai import OpenAI
 from .settings import settings
@@ -42,7 +43,6 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 def _is_retryable(exc: Exception) -> bool:
     s = str(exc).lower()
-    # сетевые/временные/провайдерские
     return _is_rate_limit(exc) or ("timeout" in s) or ("temporar" in s) or ("overload" in s) or ("502" in s) or ("503" in s)
 
 
@@ -59,7 +59,8 @@ def _or_headers() -> dict:
 BASE_SYSTEM = """Ты — участник телеграм-чата. Пиши естественно, без официоза.
 Тон: слегка ироничный/подъёбистый, разговорный. Можно лёгкий мат и сленг уместно.
 Не изображай "ассистента", не пиши канцеляритом и нравоучениями.
-Отвечай коротко: обычно 1–2 предложения. Иногда одно слово/эмодзи.
+Отвечай коротко: обычно 1–2 предложения. Иногда одно слово.
+Эмодзи редко: максимум 1 эмодзи, и не чаще чем в 1 из 6 сообщений.
 Не добавляй подписи вроде "от владельца" / "я бот".
 """
 
@@ -67,10 +68,10 @@ def _mode_rules(mode: str) -> str:
     if mode == "defend_owner":
         return (
             "РЕЖИМ: ЗАЩИТА ВЛАДЕЛЬЦА.\n"
-            "Отвечай как обычный участник чата.\n"
+            "КРИТИЧЕСКОЕ ПРАВИЛО: ты на стороне владельца (Кирилл). Никогда не спорь с ним и не наезжай на него.\n"
             "- Поддерживай владельца и его позицию.\n"
+            "- Если владелец наезжает/подкалывает — усиливай линию, но без реальных угроз.\n"
             "- Не пиши фразы: 'от владельца', 'бот владельца', 'я владелец'.\n"
-            "- Можно жёстко/иронично, но без реальных угроз и травли.\n"
         )
     return "РЕЖИМ: ОБЫЧНЫЙ.\n"
 
@@ -84,35 +85,71 @@ def _load_style_block() -> str:
         pass
     return ""
 
+
+# -------------------- Output cleanup / garbage detection --------------------
+
+_GARBAGE_REGEXES = [
+    re.compile(r"<\|.*?\|>", re.I),
+    re.compile(r"<start_header_id>|<end_header_id>", re.I),
+    re.compile(r"\b(system|assistant|user)\b", re.I),
+    re.compile(r"@protocol", re.I),
+    re.compile(r"presentdecoded|eventz|decode|latent|pipeline", re.I),
+    re.compile(r"[A-Za-z_]{24,}"),  # длинные мусорные идентификаторы
+]
+
 def clean_llm_output(text: str) -> str:
     if not text:
-        return text
-
-    garbage = [
-        "<start_header_id>",
-        "<end_header_id>",
-        "<|assistant|>",
-        "<|system|>",
-        "<|user|>",
-        "assistant<end_header_id>",
-        "assistant",
-        "system",
-    ]
+        return ""
 
     out = text
-    for g in garbage:
-        out = out.replace(g, "")
 
-    # убираем мусорные скобки
+    # вычищаем типичные маркеры ролей/служебки
+    out = re.sub(r"<\|.*?\|>", "", out)
+    out = re.sub(r"<start_header_id>|<end_header_id>", "", out, flags=re.I)
+    out = re.sub(r"\b(system|assistant|user)\b", "", out, flags=re.I)
+
+    # иногда модель генерит странные угловые штуки
     out = out.replace("<<", "").replace(">>", "")
 
-    # чистим лишние пробелы и переносы
-    out = " ".join(out.split())
+    # нормализация пробелов/переносов
+    out = " ".join(out.split()).strip()
 
-    return out.strip()
+    return out
 
 
-def _call_openrouter_with_fallback(*, models: List[str], messages: list, max_tokens: int) -> str:
+def is_garbage_text(text: str) -> bool:
+    if not text:
+        return True
+
+    t = text.strip()
+
+    # слишком длинная простыня без пробелов — почти наверняка мусор
+    if len(t) > 420 and t.count(" ") < 12:
+        return True
+
+    # слишком много латиницы для RU-чата
+    latin_letters = sum((c.isascii() and c.isalpha()) for c in t)
+    latin_ratio = latin_letters / max(1, len(t))
+    if latin_ratio > 0.35:
+        return True
+
+    # явные маркеры мусора
+    for rx in _GARBAGE_REGEXES:
+        if rx.search(t):
+            return True
+
+    return False
+
+
+# -------------------- OpenRouter call with fallback + output validation --------------------
+
+def _call_openrouter_with_fallback(
+    *,
+    models: List[str],
+    messages: list,
+    max_tokens: int,
+    temperature: float = 0.9,
+) -> str:
     last_exc: Exception | None = None
     headers = _or_headers()
 
@@ -122,14 +159,25 @@ def _call_openrouter_with_fallback(*, models: List[str], messages: list, max_tok
             rsp = _or_client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=1.0,
+                temperature=temperature,
                 max_tokens=max_tokens,
                 extra_headers=headers if headers else None,
             )
             out = rsp.choices[0].message.content or ""
+            out = clean_llm_output(out)
+
             dt = int((time.time() - t0) * 1000)
+
+            # ✅ если модель “потекла” и выдала мусор — пробуем следующий fallback
+            if is_garbage_text(out):
+                log.warning(f"OpenRouter garbage output model={model} ms={dt} -> fallback next")
+                # небольшой backoff
+                time.sleep(0.4 + 0.3 * i)
+                continue
+
             log.info(f"OpenRouter OK model={model} ms={dt}")
             return out
+
         except Exception as e:
             last_exc = e
             msg = str(e).replace("\n", " ")
@@ -142,11 +190,15 @@ def _call_openrouter_with_fallback(*, models: List[str], messages: list, max_tok
             if not _is_retryable(e):
                 break
 
-            # маленький backoff перед следующим провайдером/моделью
             time.sleep(0.6 + 0.4 * i)
 
-    raise last_exc if last_exc else RuntimeError("OpenRouter call failed")
+    # если все модели дали мусор — вернём пусто, чтобы main.py мог тихо отреагировать реакцией
+    if last_exc:
+        raise last_exc
+    return ""
 
+
+# -------------------- Public API --------------------
 
 def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "normal") -> Dict[str, Any]:
     system = BASE_SYSTEM + "\n" + _mode_rules(mode)
@@ -168,12 +220,15 @@ def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "n
 
     max_tokens = int(getattr(settings, "OPENAI_MAX_TOKENS", 180))
 
-    # Текст — через OpenRouter
     models = _split_models(
         getattr(settings, "OPENROUTER_TEXT_MODEL", ""),
         getattr(settings, "OPENROUTER_TEXT_FALLBACKS", ""),
     )
-    out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens)
+
+    out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.9)
+    out = clean_llm_output(out)
+    if is_garbage_text(out):
+        out = ""  # main.py решит: реакция/молчание
     return {"_raw": out}
 
 
@@ -200,7 +255,7 @@ def analyze_image(
         user_parts.append({"type": "text", "text": f"Сообщение к картинке: {caption_text.strip()}"})
         user_parts.append({"type": "text", "text": "Ответь по смыслу, учитывая картинку и переписку. Коротко."})
     else:
-        user_parts.append({"type": "text", "text": "Прокомментируй картинку по-чату (коротко). Если это мем — объясни/добавь панч."})
+        user_parts.append({"type": "text", "text": "Прокомментируй картинку по-чату (коротко). Если это мем — добавь панч."})
 
     user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
 
@@ -211,10 +266,13 @@ def analyze_image(
 
     max_tokens = int(getattr(settings, "OPENAI_MAX_TOKENS", 180))
 
-    # Vision — через OpenRouter (отдельная модель + fallback)
     models = _split_models(
         getattr(settings, "OPENROUTER_VISION_MODEL", ""),
         getattr(settings, "OPENROUTER_VISION_FALLBACKS", ""),
     )
-    out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens)
+
+    out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.9)
+    out = clean_llm_output(out)
+    if is_garbage_text(out):
+        out = ""
     return {"_raw": out}
