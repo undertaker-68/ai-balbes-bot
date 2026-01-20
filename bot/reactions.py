@@ -17,12 +17,12 @@ def pick_reaction(text: str) -> str:
     return random.choice(DEFAULT_REACTIONS)
 
 def should_react_only(is_mention: bool, mode: str | None = None) -> bool:
-    # СИЛЬНО реже, чем было
+    # ВАЖНО: если бота позвали — всегда текст, не только реакция
     if is_mention:
-        return random.random() < 0.18
+        return False
     if mode in ("owner", "defend_owner"):
-        return random.random() < 0.10
-    return random.random() < 0.06
+        return random.random() < 0.08
+    return random.random() < 0.05
 
 def should_react_alongside_text(is_mention: bool, mode: str | None = None) -> bool:
     if is_mention:
