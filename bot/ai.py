@@ -5,20 +5,18 @@ import re
 import base64
 import time
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from openai import OpenAI
 from .settings import settings
 
 log = logging.getLogger(__name__)
 
-# OpenRouter — OpenAI-совместимый API
 _or_client = OpenAI(
     api_key=settings.OPENROUTER_API_KEY,
     base_url=getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
 )
 
-# запасной OpenAI (если вдруг захочешь оставить)
 _oa_client = OpenAI(api_key=settings.OPENAI_API_KEY) if settings.OPENAI_API_KEY else None
 
 
@@ -26,7 +24,6 @@ def _split_models(primary: str, fallbacks_csv: str) -> List[str]:
     models = [m.strip() for m in [primary] if m and m.strip()]
     if fallbacks_csv:
         models += [m.strip() for m in fallbacks_csv.split(",") if m.strip()]
-    # уникализируем, сохраняя порядок
     out: List[str] = []
     seen = set()
     for m in models:
@@ -48,7 +45,6 @@ def _is_retryable(exc: Exception) -> bool:
 
 def _or_headers() -> dict:
     h = {}
-    # эти заголовки рекомендует OpenRouter (не обязательны)
     if getattr(settings, "OPENROUTER_SITE_URL", ""):
         h["HTTP-Referer"] = settings.OPENROUTER_SITE_URL
     if getattr(settings, "OPENROUTER_APP_NAME", ""):
@@ -86,62 +82,62 @@ def _load_style_block() -> str:
     return ""
 
 
-# -------------------- Output cleanup / garbage detection --------------------
-
 _GARBAGE_REGEXES = [
     re.compile(r"<\|.*?\|>", re.I),
     re.compile(r"<start_header_id>|<end_header_id>", re.I),
     re.compile(r"\b(system|assistant|user)\b", re.I),
     re.compile(r"@protocol", re.I),
     re.compile(r"presentdecoded|eventz|decode|latent|pipeline", re.I),
-    re.compile(r"[A-Za-z_]{24,}"),  # длинные мусорные идентификаторы
+    re.compile(r"[A-Za-z_]{24,}"),
+    # mixed cyr+lat word token
+    re.compile(r"(?i)(?=.*[a-z])(?=.*[а-яё])[a-zа-яё]+"),
+    # “кодовые” маркеры
+    re.compile(r"instanceof|prototype|undefined|null|function\(|var\s|let\s|const\s", re.I),
 ]
 
 def clean_llm_output(text: str) -> str:
     if not text:
         return ""
-
     out = text
-
-    # вычищаем типичные маркеры ролей/служебки
     out = re.sub(r"<\|.*?\|>", "", out)
     out = re.sub(r"<start_header_id>|<end_header_id>", "", out, flags=re.I)
     out = re.sub(r"\b(system|assistant|user)\b", "", out, flags=re.I)
-
-    # иногда модель генерит странные угловые штуки
     out = out.replace("<<", "").replace(">>", "")
-
-    # нормализация пробелов/переносов
     out = " ".join(out.split()).strip()
-
     return out
+
+
+def _has_mixed_script_word(t: str) -> bool:
+    for w in re.findall(r"[A-Za-zА-Яа-яЁё]{5,}", t):
+        has_lat = any("a" <= c.lower() <= "z" for c in w)
+        has_cyr = any(("а" <= c.lower() <= "я") or (c.lower() == "ё") for c in w)
+        if has_lat and has_cyr:
+            return True
+    return False
 
 
 def is_garbage_text(text: str) -> bool:
     if not text:
         return True
-
     t = text.strip()
 
-    # слишком длинная простыня без пробелов — почти наверняка мусор
+    if _has_mixed_script_word(t):
+        return True
+
     if len(t) > 420 and t.count(" ") < 12:
         return True
 
-    # слишком много латиницы для RU-чата
     latin_letters = sum((c.isascii() and c.isalpha()) for c in t)
     latin_ratio = latin_letters / max(1, len(t))
     if latin_ratio > 0.35:
         return True
 
-    # явные маркеры мусора
     for rx in _GARBAGE_REGEXES:
         if rx.search(t):
             return True
 
     return False
 
-
-# -------------------- OpenRouter call with fallback + output validation --------------------
 
 def _call_openrouter_with_fallback(
     *,
@@ -165,13 +161,10 @@ def _call_openrouter_with_fallback(
             )
             out = rsp.choices[0].message.content or ""
             out = clean_llm_output(out)
-
             dt = int((time.time() - t0) * 1000)
 
-            # ✅ если модель “потекла” и выдала мусор — пробуем следующий fallback
             if is_garbage_text(out):
                 log.warning(f"OpenRouter garbage output model={model} ms={dt} -> fallback next")
-                # небольшой backoff
                 time.sleep(0.4 + 0.3 * i)
                 continue
 
@@ -186,19 +179,14 @@ def _call_openrouter_with_fallback(
             else:
                 log.warning(f"OpenRouter error model={model}: {msg}")
 
-            # если ошибка не ретраибл — не мучаем другие модели
             if not _is_retryable(e):
                 break
-
             time.sleep(0.6 + 0.4 * i)
 
-    # если все модели дали мусор — вернём пусто, чтобы main.py мог тихо отреагировать реакцией
     if last_exc:
         raise last_exc
     return ""
 
-
-# -------------------- Public API --------------------
 
 def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "normal") -> Dict[str, Any]:
     system = BASE_SYSTEM + "\n" + _mode_rules(mode)
@@ -209,9 +197,7 @@ def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "n
     messages = [{"role": "system", "content": system}]
 
     if context_snippets:
-        messages.append(
-            {"role": "user", "content": f"Память чата за последние 24 часа (сжатая):\n{context_snippets}"}
-        )
+        messages.append({"role": "user", "content": f"Память чата за последние 24 часа (сжатая):\n{context_snippets}"})
 
     if user_text.strip():
         messages.append({"role": "user", "content": user_text.strip()})
@@ -228,7 +214,7 @@ def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "n
     out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.9)
     out = clean_llm_output(out)
     if is_garbage_text(out):
-        out = ""  # main.py решит: реакция/молчание
+        out = ""
     return {"_raw": out}
 
 
