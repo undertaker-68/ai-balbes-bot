@@ -84,6 +84,33 @@ def _load_style_block() -> str:
         pass
     return ""
 
+def clean_llm_output(text: str) -> str:
+    if not text:
+        return text
+
+    garbage = [
+        "<start_header_id>",
+        "<end_header_id>",
+        "<|assistant|>",
+        "<|system|>",
+        "<|user|>",
+        "assistant<end_header_id>",
+        "assistant",
+        "system",
+    ]
+
+    out = text
+    for g in garbage:
+        out = out.replace(g, "")
+
+    # убираем мусорные скобки
+    out = out.replace("<<", "").replace(">>", "")
+
+    # чистим лишние пробелы и переносы
+    out = " ".join(out.split())
+
+    return out.strip()
+
 
 def _call_openrouter_with_fallback(*, models: List[str], messages: list, max_tokens: int) -> str:
     last_exc: Exception | None = None
