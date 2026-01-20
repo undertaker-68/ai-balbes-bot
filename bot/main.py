@@ -389,6 +389,7 @@ async def on_text(message: Message, bot: Bot) -> None:
         ctx = ctx + "\n\n[ЦЕЛЬ]\nПоддержи владельца и усиливай его подкол/линию наезда на оппонента. Держи тему 2-4 реплики."
 
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
+    raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
 
     if not raw:
@@ -448,6 +449,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
         log.debug(f"download photo error: {e}")
         fallback_text = caption or "чё за фотка, не прогрузилась"
         raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
+        raw = clean_llm_output(raw)
         raw = _strip_self_mention(raw, bot_username_lower)
         if raw:
             await message.reply(raw)
