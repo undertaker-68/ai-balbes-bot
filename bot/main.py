@@ -9,14 +9,14 @@ from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReactionTypeEmoji
+from aiogram.types import BufferedInputFile
 
 from .settings import settings
 from .ai import generate_reply, analyze_image, clean_llm_output, is_garbage_text
 from .reactions import pick_reaction, should_react_only
 from .services.giphy import search_gif
-
-from aiogram.types import BufferedInputFile
-from .services.tts import tts_to_ogg_opus
+from .services.tts import tts_to_ogg_opus_random
+from .services.image_gen import generate_image_url
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -24,17 +24,13 @@ log = logging.getLogger(__name__)
 _pg_pool: asyncpg.Pool | None = None
 
 _last_reply_ts: dict[int, float] = {}
-_dialog_state: dict[tuple[int, int], tuple[float, int]] = {}  # (chat_id, user_id) -> (until_ts, streak)
+_dialog_state: dict[tuple[int, int], tuple[float, int]] = {}
 
-# анти-спам спонтанных сообщений
-_last_spontaneous_ts: dict[int, float] = {}        # chat_id -> ts
-_last_seen_chat_activity_ts: dict[int, float] = {} # chat_id -> ts
+_last_spontaneous_ts: dict[int, float] = {}
+_last_seen_chat_activity_ts: dict[int, float] = {}
 
-
-# -------------------- DB save --------------------
 
 async def save_and_index(message: Message) -> None:
-    """Сохраняем входящее сообщение в tg_history."""
     global _pg_pool
     if _pg_pool is None:
         return
@@ -80,8 +76,6 @@ async def save_and_index(message: Message) -> None:
     except Exception as e:
         log.debug(f"save_and_index error: {e}")
 
-
-# -------------------- Memory 24h --------------------
 
 async def build_context_24h(chat_id: int) -> str:
     global _pg_pool
@@ -172,14 +166,12 @@ async def build_user_context_24h(chat_id: int, user_id: int) -> str:
     return "\n".join(parts)
 
 
-# -------------------- Dialog state --------------------
-
 def _dialog_is_active(chat_id: int, user_id: int) -> bool:
     key = (chat_id, user_id)
     v = _dialog_state.get(key)
     if not v:
         return False
-    until_ts, _streak = v
+    until_ts, _ = v
     if time.time() > until_ts:
         _dialog_state.pop(key, None)
         return False
@@ -193,8 +185,6 @@ def _dialog_touch(chat_id: int, user_id: int, *, extend_sec: int = 220, max_turn
     _dialog_state[key] = (time.time() + extend_sec, streak)
 
 
-# -------------------- Reactions --------------------
-
 async def react(bot: Bot, message: Message, emoji: str) -> None:
     try:
         await bot.set_message_reaction(
@@ -205,8 +195,6 @@ async def react(bot: Bot, message: Message, emoji: str) -> None:
     except Exception as e:
         log.debug(f"reaction error: {e}")
 
-
-# -------------------- Helpers --------------------
 
 def _owner_defense_mode_for_text(text: str, message: Message) -> str:
     text_l = (text or "").lower()
@@ -239,32 +227,24 @@ async def _compute_is_mention(bot: Bot, message: Message, text: str) -> tuple[bo
 
 
 def _strip_self_mention(text: str, bot_username_lower: str) -> str:
-    if not text:
+    if not text or not bot_username_lower:
         return text
-    if not bot_username_lower:
-        return text
-
     handle = "@" + bot_username_lower
     out = text.replace(handle, "")
     while handle in out.lower():
         i = out.lower().find(handle)
         out = out[:i] + out[i + len(handle):]
-
-    out = " ".join(out.split())
-    return out.strip()
+    return " ".join(out.split()).strip()
 
 
 def _soft_address_prefix(message: Message) -> str:
-    """Без reply-веток — иногда добавляем имя, чтобы было понятно, кому ответ."""
     if not message.from_user:
         return ""
-    # не всегда, чтобы не выглядело как бот-саппорт
     if random.random() < 0.55:
         return ""
     name = (message.from_user.first_name or message.from_user.full_name or "").strip()
     if not name:
         return ""
-    # короткое обращение
     return f"{name}, "
 
 
@@ -280,16 +260,14 @@ async def _gate_reply(
     uid = message.from_user.id if message.from_user else None
     is_owner = (uid == settings.OWNER_USER_ID)
 
-    # не отвечаем сами себе
     if uid is not None and uid == bot_id:
         return False
 
     chat_id = int(message.chat.id)
     now = time.time()
 
-    # диалог-окно имеет приоритет (включая владельца)
+    # диалог-окно: отвечаем, но на "угу/ок/ну" реже
     if uid is not None and _dialog_is_active(chat_id, uid):
-        # на супер-короткие "угу/вот/ваще" отвечаем реже, но не запрещаем
         t = (message.text or "").strip().lower()
         if t in {"угу", "ага", "вот", "ваще", "ок", "ясно", "пон", "ну"} or len(t) <= 3:
             if random.random() < 0.70:
@@ -298,7 +276,7 @@ async def _gate_reply(
                 return False
         return True
 
-    # владелец: молчим, НО если позвал бота — отвечаем
+    # владелец: молчим, но если позвал — отвечаем
     if is_owner and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return False
 
@@ -319,18 +297,26 @@ async def _gate_reply(
 
     return True
 
+
 def wants_voice(user_text: str) -> bool:
     t = (user_text or "").lower()
-    return any(k in t for k in ["голосом", "озвуч", "запиши войс", "войсом", "voice"])
+    return any(k in t for k in ["голосом", "озвуч", "озвучь", "войсом", "войс", "запиши войс", "voice"])
 
 
-# -------------------- Handlers --------------------
+def wants_image(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    keys = [
+        "нарисуй", "сгенерируй", "создай картинку", "сделай картинку",
+        "сделай изображение", "создай изображение", "нарисуешь",
+        "draw", "generate an image", "make an image",
+    ]
+    return any(k in t for k in keys)
+
 
 async def on_text(message: Message, bot: Bot) -> None:
     if int(message.chat.id) != int(settings.TARGET_GROUP_ID):
         return
 
-    # отметим активность
     _last_seen_chat_activity_ts[int(message.chat.id)] = time.time()
 
     text = (message.text or "").strip()
@@ -368,14 +354,25 @@ async def on_text(message: Message, bot: Bot) -> None:
     if user_ctx:
         ctx = ctx + "\n\n[ЛИЧНЫЙ КОНТЕКСТ ЭТОГО УЧАСТНИКА ЗА 24Ч]\n" + user_ctx
 
-    # На mention/reply — НИКОГДА не react-only
+    # ✅ картинка по запросу
+    if wants_image(text):
+        prompt = text.replace("@" + bot_username_lower, "").strip()
+        img_url = await generate_image_url(prompt)
+        if img_url:
+            await bot.send_photo(chat_id=message.chat.id, photo=img_url)
+            if uid is not None:
+                _dialog_touch(int(message.chat.id), uid)
+            return
+        # если токена нет/ошибка — продолжим обычным текстом
+
+    # mention/reply — никогда react-only
     if (not is_mention) and should_react_only(is_mention, mode):
         await react(bot, message, emoji)
         if uid is not None:
             _dialog_touch(int(message.chat.id), uid)
         return
 
-    # иногда гифка (без reply_to_message_id, чтобы не засорять ветками)
+    # иногда гифка (без reply)
     if getattr(settings, "GIPHY_API_KEY", ""):
         p = float(getattr(settings, "GIPHY_PROB", 0.22))
         if mode == "defend_owner":
@@ -391,10 +388,7 @@ async def on_text(message: Message, bot: Bot) -> None:
 
             if gif_url:
                 try:
-                    await bot.send_animation(
-                        chat_id=message.chat.id,
-                        animation=gif_url,
-                    )
+                    await bot.send_animation(chat_id=message.chat.id, animation=gif_url)
                     if uid is not None:
                         _dialog_touch(int(message.chat.id), uid)
                     return
@@ -409,19 +403,40 @@ async def on_text(message: Message, bot: Bot) -> None:
     raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
-    if wants_voice(text):
-        audio = await tts_to_ogg_opus(raw)
-        vf = BufferedInputFile(audio, filename="voice.ogg")
-        await bot.send_voice(chat_id=message.chat.id, voice=vf)
-    return
 
+    # если мусор — один ретрай “без мусора”
     if (not raw) or is_garbage_text(raw):
-        # мусор не шлём
-        if random.random() < 0.45:
-            await react(bot, message, emoji)
-        return
+        raw2 = generate_reply(
+            user_text=f"{text}\n\n(Ответь по-человечески, без мусорных слов и без латиницы внутри русских слов.)",
+            context_snippets=ctx,
+            mode=mode,
+        ).get("_raw", "").strip()
+        raw2 = clean_llm_output(raw2)
+        raw2 = _strip_self_mention(raw2, bot_username_lower)
+        if (not raw2) or is_garbage_text(raw2):
+            if random.random() < 0.45:
+                await react(bot, message, emoji)
+            return
+        raw = raw2
 
-    # без reply-веток: отправляем обычным сообщением
+    # ✅ voice по запросу (или редко “сам”)
+    do_voice = wants_voice(text)
+    if (not do_voice) and _dialog_is_active(int(message.chat.id), uid or -1):
+        if random.random() < float(getattr(settings, "AUTO_VOICE_PROB", 0.03)):
+            do_voice = True
+
+    if do_voice:
+        try:
+            ogg_bytes, preset, voice = await tts_to_ogg_opus_random(raw)
+            vf = BufferedInputFile(ogg_bytes, filename="voice.ogg")
+            await bot.send_voice(chat_id=message.chat.id, voice=vf)
+            if uid is not None:
+                _dialog_touch(int(message.chat.id), uid)
+            return
+        except Exception as e:
+            log.debug(f"tts error: {e}")
+            # если tts упал — просто текстом
+
     prefix = _soft_address_prefix(message)
     try:
         await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
@@ -437,7 +452,6 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if not message.photo:
         return
 
-    # отметим активность
     _last_seen_chat_activity_ts[int(message.chat.id)] = time.time()
 
     await save_and_index(message)
@@ -449,7 +463,6 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if uid is not None and uid == bot_id:
         return
 
-    # владелец: молчим, НО если позвал — отвечаем
     if uid == settings.OWNER_USER_ID and not bool(getattr(settings, "REPLY_TO_OWNER", False)) and not is_mention:
         return
 
@@ -467,7 +480,6 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if user_ctx:
         ctx = ctx + "\n\n[ЛИЧНЫЙ КОНТЕКСТ ЭТОГО УЧАСТНИКА ЗА 24Ч]\n" + user_ctx
 
-    # скачиваем фото
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
@@ -475,23 +487,9 @@ async def on_photo(message: Message, bot: Bot) -> None:
         image_bytes = buf.read()
     except Exception as e:
         log.debug(f"download photo error: {e}")
-        # fallback на текстовый ответ
-        fallback_text = caption or "чё за фотка, не прогрузилась"
-        raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
-        raw = clean_llm_output(raw)
-        raw = _strip_self_mention(raw, bot_username_lower)
-
-        if (not raw) or is_garbage_text(raw):
-            await react(bot, message, emoji)
-            return
-
-        prefix = _soft_address_prefix(message)
-        await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
-        if uid is not None:
-            _dialog_touch(int(message.chat.id), uid)
+        await react(bot, message, emoji)
         return
 
-    # vision
     try:
         raw = analyze_image(
             image_bytes=image_bytes,
@@ -501,8 +499,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
         ).get("_raw", "").strip()
     except Exception as e:
         log.debug(f"vision error: {e}")
-        fallback_text = caption or "ну и что это за фотка вообще"
-        raw = generate_reply(user_text=fallback_text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
+        raw = ""
 
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
@@ -511,19 +508,11 @@ async def on_photo(message: Message, bot: Bot) -> None:
         await react(bot, message, emoji)
         return
 
-    if random.random() < 0.10:
-        await react(bot, message, emoji)
-
     prefix = _soft_address_prefix(message)
-    try:
-        await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
-        if uid is not None:
-            _dialog_touch(int(message.chat.id), uid)
-    except Exception as e:
-        log.error(f"send_message error: {e}")
+    await bot.send_message(chat_id=message.chat.id, text=(prefix + raw).strip())
+    if uid is not None:
+        _dialog_touch(int(message.chat.id), uid)
 
-
-# -------------------- Spontaneous (max 1 per hour) --------------------
 
 async def spontaneous_loop(bot: Bot) -> None:
     chat_id = int(settings.TARGET_GROUP_ID)
@@ -531,7 +520,7 @@ async def spontaneous_loop(bot: Bot) -> None:
     while True:
         await asyncio.sleep(
             random.randint(
-                int(getattr(settings, "SPONTANEOUS_MIN_SEC", 600)),   # раз в 10-20 минут проверяем
+                int(getattr(settings, "SPONTANEOUS_MIN_SEC", 600)),
                 int(getattr(settings, "SPONTANEOUS_MAX_SEC", 1200)),
             )
         )
@@ -541,13 +530,11 @@ async def spontaneous_loop(bot: Bot) -> None:
 
         now = time.time()
 
-        # максимум 1 сообщение в час
         cooldown = int(getattr(settings, "SPONTANEOUS_COOLDOWN_SEC", 3600))
         last_sp = _last_spontaneous_ts.get(chat_id, 0.0)
         if now - last_sp < cooldown:
             continue
 
-        # только если чат молчит N секунд
         silent_need = int(getattr(settings, "SPONTANEOUS_ONLY_IF_SILENT_SEC", 600))
         last_act = _last_seen_chat_activity_ts.get(chat_id, 0.0)
         if last_act and (now - last_act) < silent_need:
@@ -572,8 +559,6 @@ async def spontaneous_loop(bot: Bot) -> None:
         except Exception as e:
             log.debug(f"spontaneous error: {e}")
 
-
-# -------------------- Main --------------------
 
 async def main() -> None:
     bot = Bot(token=settings.BOT_TOKEN)
