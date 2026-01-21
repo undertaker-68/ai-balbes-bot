@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import os
 import asyncpg
 import logging
 import random
@@ -24,6 +26,7 @@ log = logging.getLogger(__name__)
 _pg_pool: asyncpg.Pool | None = None
 
 _last_reply_ts: dict[int, float] = {}
+_last_gif_ts: dict[int, float] = {}
 _dialog_state: dict[tuple[int, int], tuple[float, int]] = {}
 
 _last_spontaneous_ts: dict[int, float] = {}
@@ -170,7 +173,7 @@ async def build_user_context_24h(chat_id: int, user_id: int) -> str:
         return ""
 
     rows = list(reversed(rows))
-    max_chars = 1200
+    max_chars = int(getattr(settings, "USER_MEMORY_MAX_CHARS", 300))
 
     parts: list[str] = []
     cur = 0
@@ -420,6 +423,7 @@ async def on_text(message: Message, bot: Bot) -> None:
             if gif_url:
                 try:
                     await bot.send_animation(chat_id=message.chat.id, animation=gif_url)
+                    _last_gif_ts[int(message.chat.id)] = time.time()
                     if uid is not None:
                         _dialog_touch(int(message.chat.id), uid)
                     return
@@ -433,26 +437,35 @@ async def on_text(message: Message, bot: Bot) -> None:
 
     max_in = int(getattr(settings, "MAX_INPUT_CHARS", 20000))
     text_for_model = text[:max_in]
-    raw = generate_reply(user_text=text, context_snippets=ctx, mode=mode).get("_raw", "").strip()
+
+    try:
+        raw = generate_reply(user_text=text_for_model, context_snippets=ctx, mode=mode).get("_raw", "").strip()
+    except Exception as e:
+        log.error(f"generate_reply error: {e}")
+        raw = ""
+
     raw = clean_llm_output(raw)
     raw = _strip_self_mention(raw, bot_username_lower)
 
     # если мусор — один ретрай “без мусора”
     if (not raw) or is_garbage_text(raw):
-        raw2 = generate_reply(
-            user_text=f"{text}\n\n(Ответь по-человечески, без мусорных слов и без латиницы внутри русских слов.)",
-            context_snippets=ctx,
-            mode=mode,
-        ).get("_raw", "").strip()
+        try:
+            raw2 = generate_reply(
+                user_text=f"{text_for_model}\n\n(Ответь по-человечески, без мусорных слов и без латиницы внутри русских слов.)",
+                context_snippets=ctx,
+                mode=mode,
+            ).get("_raw", "").strip()
+        except Exception as e:
+            log.error(f"generate_reply retry error: {e}")
+            raw2 = ""
+
         raw2 = clean_llm_output(raw2)
         raw2 = _strip_self_mention(raw2, bot_username_lower)
         if (not raw2) or is_garbage_text(raw2):
             if random.random() < 0.45:
                 await react(bot, message, emoji)
             return
-        raw = raw2
-
-    # ✅ voice по запросу (или редко “сам”)
+        raw = raw2# ✅ voice по запросу (или редко “сам”)
     do_voice = wants_voice(text)
     if (not do_voice) and _dialog_is_active(int(message.chat.id), uid or -1):
         if random.random() < float(getattr(settings, "AUTO_VOICE_PROB", 0.03)):
@@ -594,6 +607,18 @@ async def spontaneous_loop(bot: Bot) -> None:
 
 
 async def main() -> None:
+    # INSTANCE_LOCK: предотвращаем два запуска на одном сервере
+    lock_path = os.path.join('/tmp', 'ai-balbes-bot.lock')
+    try:
+        global _instance_lock_fp
+        _instance_lock_fp = open(lock_path, 'w')
+        fcntl.flock(_instance_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _instance_lock_fp.write(str(os.getpid()))
+        _instance_lock_fp.flush()
+    except Exception:
+        log.error('Another bot instance is already running on this server (instance lock). Exiting.')
+        return
+
     bot = Bot(token=settings.BOT_TOKEN)
 
     global _pg_pool
