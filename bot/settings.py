@@ -50,11 +50,13 @@ class Settings(BaseSettings):
     GIPHY_API_KEY: str = ""
     GIPHY_RATING: str = "r"
     GIPHY_LANG: str = "ru"
-    GIPHY_PROB: float = 0.22
+    GIPHY_PROB: float = 0.06
+    GIPHY_COOLDOWN_SEC: int = 300  # минимум секунд между гифками в одном чате
 
     # Memory 24h
-    MEMORY_24H_LIMIT: int = 70
-    MEMORY_24H_MAX_CHARS: int = 6500
+    MEMORY_24H_LIMIT: int = 20
+    MEMORY_24H_MAX_CHARS: int = 1200
+    USER_MEMORY_MAX_CHARS: int = 300  # личный контекст автора за 24ч
 
     # Reply behavior
     REPLY_TO_OWNER: bool = False          # владелец -> вообще не отвечать
