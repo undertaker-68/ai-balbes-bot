@@ -10,6 +10,18 @@ from typing import Dict, Any, List
 from openai import OpenAI
 from .settings import settings
 
+
+def _approx_tokens(s: str) -> int:
+    # грубая оценка: 1 токен ~ 3-4 символа для рус/англ
+    return max(1, len(s) // 4) if s else 0
+
+def _truncate_by_tokens(s: str, max_tokens: int) -> str:
+    if not s or max_tokens <= 0:
+        return ""
+    # запас на прочие части промпта
+    max_chars = max(0, max_tokens * 4)
+    return s[-max_chars:] if len(s) > max_chars else s
+
 log = logging.getLogger(__name__)
 
 _or_client = OpenAI(
@@ -191,30 +203,75 @@ def _call_openrouter_with_fallback(
 
 
 def generate_reply(*, user_text: str, context_snippets: str = "", mode: str = "normal") -> Dict[str, Any]:
-    system = BASE_SYSTEM + "\n" + _mode_rules(mode)
+    """Главная текстовая генерация.
+
+    Важно: на бесплатном OpenRouter лимиты prompt tokens могут быть очень низкими (в логах было 521).
+    Поэтому тут есть:
+      - жёсткое урезание контекста по токен-бюджету
+      - fallback на "минимальный" запрос при 402 (prompt tokens limit exceeded)
+    """
+    system_base = BASE_SYSTEM + "\n" + _mode_rules(mode)
     style = _load_style_block()
-    if style:
-        system += "\n\n" + style
+    system = system_base + ("\n\n" + style if style else "")
 
-    messages = [{"role": "system", "content": system}]
+    user = (user_text or "").strip()
+    if not user:
+        user = "Сделай короткий вброс в чат (1–2 предложения), в стиле чата."
 
-    if context_snippets:
-        messages.append({"role": "user", "content": f"Память чата за последние 24 часа (сжатая):\n{context_snippets}"})
+    # Бюджет prompt tokens (не response). Если не задано — берём безопасный минимум.
+    prompt_budget = int(getattr(settings, "OPENROUTER_PROMPT_BUDGET_TOKENS", 520))
+    # Запас на форматирование/ролями/служебное
+    overhead = 120
 
-    if user_text.strip():
-        messages.append({"role": "user", "content": user_text.strip()})
-    else:
-        messages.append({"role": "user", "content": "Сделай короткий вброс в чат (1–2 предложения), в стиле чата."})
+    ctx = (context_snippets or "").strip()
+    if ctx:
+        # Сначала урезаем по токенам с учётом system+user
+        remaining = max(0, prompt_budget - _approx_tokens(system) - _approx_tokens(user) - overhead)
+        ctx = _truncate_by_tokens(ctx, remaining)
 
-    max_tokens = int(getattr(settings, "OPENAI_MAX_TOKENS", 180))
+    def _call(system_text: str, ctx_text: str) -> str:
+        messages = [{"role": "system", "content": system_text}]
+        if ctx_text:
+            messages.append({"role": "user", "content": f"Память чата за последние 24 часа (сжатая):\n{ctx_text}"})
+        messages.append({"role": "user", "content": user})
 
-    models = _split_models(
-        getattr(settings, "OPENROUTER_TEXT_MODEL", ""),
-        getattr(settings, "OPENROUTER_TEXT_FALLBACKS", ""),
-    )
+        max_tokens = int(getattr(settings, "OPENAI_MAX_TOKENS", 180))
+        models = _split_models(
+            getattr(settings, "OPENROUTER_TEXT_MODEL", ""),
+            getattr(settings, "OPENROUTER_TEXT_FALLBACKS", ""),
+        )
+        out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.9)
+        out = clean_llm_output(out)
+        return out
 
-    out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.9)
-    out = clean_llm_output(out)
+    try:
+        out = _call(system, ctx)
+    except Exception as e:
+        s = str(e)
+        # 402 от OpenRouter = prompt tokens limit exceeded / нет кредитов / жёсткий лимит
+        if ("Error code: 402" in s) or ("Prompt tokens limit exceeded" in s):
+            # 1) попробуем без style, с урезанным user
+            mini_system = (
+                system_base
+                + "\n\n"
+                + "ВАЖНО: отвечай кратко (1-2 предложения), без мусора, без подписи, без 'я бот'."
+            )
+            mini_user = user[:800]
+            try:
+                # override user локально
+                messages = [{"role": "system", "content": mini_system}, {"role": "user", "content": mini_user}]
+                max_tokens = int(getattr(settings, "OPENAI_MAX_TOKENS", 140))
+                models = _split_models(
+                    getattr(settings, "OPENROUTER_TEXT_MODEL", ""),
+                    getattr(settings, "OPENROUTER_TEXT_FALLBACKS", ""),
+                )
+                out = _call_openrouter_with_fallback(models=models, messages=messages, max_tokens=max_tokens, temperature=0.8)
+                out = clean_llm_output(out)
+            except Exception:
+                out = ""
+        else:
+            raise
+
     if is_garbage_text(out):
         out = ""
     return {"_raw": out}
